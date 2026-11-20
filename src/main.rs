@@ -53,7 +53,6 @@ const PNG: u16 = 125;
 const UNDO: u16 = 126;
 const ERASE: u16 = 127;
 const SHAPE: u16 = 128;
-const COLOR: u16 = 129;
 const ZOOM_PICKER: u16 = 130;
 const THEME: u16 = 131;
 const MENU_FILE: u16 = 140;
@@ -182,7 +181,6 @@ const TOOLS: &[(u16, Label)] = &[
     (PNG, ("I&mpor tanda tangan PNG…", "&Import PNG signature…")),
     (ERASE, ("&Hapus objek", "&Erase object")),
     (SHAPE, ("&Bentuk…", "S&hape…")),
-    (COLOR, ("&Warna…", "&Color…")),
     (
         UNDO,
         (
@@ -897,7 +895,6 @@ impl App {
                 let enabled = matches!(id, OPEN | THEME)
                     || self.doc.as_ref().is_some_and(|doc| match id {
                         UNDO => doc.can_undo(),
-                        COLOR => self.color_slot().is_some(),
                         _ => true,
                     });
                 let _ = EnableWindow(button, enabled);
@@ -914,7 +911,6 @@ impl App {
                         PREVIOUS => doc.index > 0,
                         NEXT => doc.index + 1 < doc.count(),
                         UNDO => doc.can_undo(),
-                        COLOR => self.color_slot().is_some(),
                         _ => true,
                     });
                 let _ = EnableMenuItem(
@@ -928,7 +924,7 @@ impl App {
                 THEME as u32,
                 (MF_BYCOMMAND | if self.dark { MF_CHECKED } else { MF_UNCHECKED }).0,
             );
-            for &(id, _) in TOOLS.iter().filter(|(id, _)| !matches!(*id, UNDO | COLOR)) {
+            for &(id, _) in TOOLS.iter().filter(|(id, _)| *id != UNDO) {
                 let _ = CheckMenuItem(
                     menu,
                     id as u32,
@@ -1036,7 +1032,7 @@ impl App {
                         MF_UNCHECKED
                     };
                     AppendMenuW(menu, MF_STRING | check, index + 1, PCWSTR(label.as_ptr()))?;
-                    if matches!(id, COLOR | TEXT | SKETCH | SIGN) {
+                    if matches!(id, TEXT | SKETCH | SIGN) {
                         let swatch = chrome::ColorSwatch::new(COLORS[index].1, self.dpi);
                         let info = MENUITEMINFOW {
                             cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
@@ -1045,6 +1041,30 @@ impl App {
                             ..Default::default()
                         };
                         SetMenuItemInfoW(menu, index as u32, true, &info)?;
+                        swatches.push(swatch);
+                    }
+                }
+                if id == SHAPE {
+                    AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null())?;
+                    let heading = wide(self.language.text(("Warna", "Color")));
+                    AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, PCWSTR(heading.as_ptr()))?;
+                    for (index, (label, color)) in COLORS.iter().enumerate() {
+                        let label = wide(self.language.text(*label));
+                        let check = if self.colors[3] == index {
+                            MF_CHECKED
+                        } else {
+                            MF_UNCHECKED
+                        };
+                        let command = SHAPES.len() + index + 1;
+                        AppendMenuW(menu, MF_STRING | check, command, PCWSTR(label.as_ptr()))?;
+                        let swatch = chrome::ColorSwatch::new(*color, self.dpi);
+                        let info = MENUITEMINFOW {
+                            cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+                            fMask: MIIM_BITMAP,
+                            hbmpItem: swatch.0,
+                            ..Default::default()
+                        };
+                        SetMenuItemInfoW(menu, command as u32, false, &info)?;
                         swatches.push(swatch);
                     }
                 }
@@ -1139,34 +1159,17 @@ impl App {
             }
             return Ok(());
         }
-        if id == COLOR {
-            if let Some(slot) = self.color_slot()
-                && let Some(color) = self.tool_options(
-                    hwnd,
-                    COLOR,
-                    COLORS.iter().map(|item| item.0),
-                    self.colors[slot],
-                )?
-            {
-                self.colors[slot] = color;
-                repaint(hwnd);
-                unsafe {
-                    let _ = SetFocus(if self.text_at.is_some() {
-                        self.editor
-                    } else {
-                        hwnd
-                    });
-                }
-            }
-            return Ok(());
-        }
         if id == SHAPE && self.doc.is_some() {
             let Some(shape) =
                 self.tool_options(hwnd, SHAPE, SHAPES.iter().map(|item| item.0), self.shape)?
             else {
                 return Ok(());
             };
-            self.shape = shape;
+            if shape < SHAPES.len() {
+                self.shape = shape;
+            } else {
+                self.colors[3] = shape - SHAPES.len();
+            }
         }
         if let Some(doc) = &self.doc
             && matches!(id, PREVIOUS | NEXT)
@@ -2096,7 +2099,6 @@ extern "system" fn window_proc(
                             SKETCH => Some(COLORS[app.colors[1]].1),
                             SIGN => Some(COLORS[app.colors[2]].1),
                             SHAPE => Some(COLORS[app.colors[3]].1),
-                            COLOR => app.color_slot().map(|slot| COLORS[app.colors[slot]].1),
                             _ => None,
                         },
                     );
