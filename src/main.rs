@@ -1021,6 +1021,7 @@ impl App {
             let mut anchor = RECT::default();
             GetWindowRect(*button, &mut anchor)?;
             let menu = CreatePopupMenu()?;
+            let mut swatches = Vec::new();
             let result = (|| -> Result<i32> {
                 for (index, label) in labels.enumerate() {
                     let label = wide(self.language.text(label));
@@ -1030,6 +1031,17 @@ impl App {
                         MF_UNCHECKED
                     };
                     AppendMenuW(menu, MF_STRING | check, index + 1, PCWSTR(label.as_ptr()))?;
+                    if matches!(id, COLOR | TEXT | SKETCH | SIGN) {
+                        let swatch = chrome::ColorSwatch::new(COLORS[index].1, self.dpi);
+                        let info = MENUITEMINFOW {
+                            cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+                            fMask: MIIM_BITMAP,
+                            hbmpItem: swatch.0,
+                            ..Default::default()
+                        };
+                        SetMenuItemInfoW(menu, index as u32, true, &info)?;
+                        swatches.push(swatch);
+                    }
                 }
                 Ok(TrackPopupMenuEx(
                     menu,
@@ -1252,6 +1264,17 @@ impl App {
                 self.tool = id;
                 self.signature = None;
                 self.sync(hwnd);
+                if matches!(id, TEXT | SKETCH | SIGN) {
+                    let slot = self.color_slot().unwrap();
+                    if let Some(color) = self.tool_options(
+                        hwnd,
+                        id,
+                        COLORS.iter().map(|item| item.0),
+                        self.colors[slot],
+                    )? {
+                        self.colors[slot] = color;
+                    }
+                }
                 unsafe {
                     let _ = SetFocus(hwnd);
                 }
@@ -2021,6 +2044,14 @@ extern "system" fn window_proc(
                         app.contrast,
                         app.dark,
                         app.icon_font,
+                        match item.CtlID as u16 {
+                            TEXT => Some(COLORS[app.colors[0]].1),
+                            SKETCH => Some(COLORS[app.colors[1]].1),
+                            SIGN => Some(COLORS[app.colors[2]].1),
+                            SHAPE => Some(COLORS[app.colors[3]].1),
+                            COLOR => app.color_slot().map(|slot| COLORS[app.colors[slot]].1),
+                            _ => None,
+                        },
                     );
                 }
             }

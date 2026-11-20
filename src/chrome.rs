@@ -70,6 +70,42 @@ pub const TOOLS: &[(u16, Label, u16)] = &[
     (super::THEME, ("Tema", "Theme"), 0xe708),
 ];
 pub const ICON_SIZE: i32 = 16;
+// The menu owns no bitmap resources; keep these alive until it is destroyed.
+pub struct ColorSwatch(pub HBITMAP);
+
+impl ColorSwatch {
+    pub fn new(color: pdfium_render::prelude::PdfColor, dpi: f32) -> Self {
+        unsafe {
+            let size = (18.0 * dpi).round() as i32;
+            let screen = GetDC(None);
+            let dc = CreateCompatibleDC(screen);
+            let bitmap = CreateCompatibleBitmap(screen, size, size);
+            let previous = SelectObject(dc, bitmap);
+            let brush = CreateSolidBrush(rgb(color.red(), color.green(), color.blue()));
+            let rect = RECT {
+                left: 0,
+                top: 0,
+                right: size,
+                bottom: size,
+            };
+            FillRect(dc, &rect, brush);
+            FrameRect(dc, &rect, GetSysColorBrush(COLOR_GRAYTEXT));
+            SelectObject(dc, previous);
+            let _ = DeleteObject(brush);
+            let _ = DeleteDC(dc);
+            ReleaseDC(None, screen);
+            Self(bitmap)
+        }
+    }
+}
+
+impl Drop for ColorSwatch {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DeleteObject(self.0);
+        }
+    }
+}
 pub const ICON_GAP: i32 = 6;
 pub const HEADER: i32 = 56;
 pub const LIGHT_SURFACE: u32 = 0xf8f9fc;
@@ -152,6 +188,7 @@ pub fn draw_button(
     contrast: bool,
     dark: bool,
     icon_font: HFONT,
+    ink: Option<pdfium_render::prelude::PdfColor>,
 ) {
     let base_color = colorref(if dark { DARK_SURFACE } else { LIGHT_SURFACE });
     let id = item.CtlID as u16;
@@ -286,6 +323,18 @@ pub fn draw_button(
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
         );
         SelectObject(dc, old_font);
+        if let Some(color) = ink {
+            let brush = CreateSolidBrush(rgb(color.red(), color.green(), color.blue()));
+            let inset = (10.0 * dpi).round() as i32;
+            let stripe = RECT {
+                left: r.left + inset,
+                right: r.right - inset,
+                top: r.bottom - (5.0 * dpi).round() as i32,
+                bottom: r.bottom - (2.0 * dpi).round() as i32,
+            };
+            FillRect(dc, &stripe, brush);
+            let _ = DeleteObject(brush);
+        }
         if focused {
             let focus_pen = CreatePen(
                 PS_SOLID,
