@@ -2,9 +2,12 @@
 
 mod canvas;
 mod chrome;
+mod drawing;
+mod page_picker;
 mod pdf;
 
 use std::{
+    borrow::Cow,
     cell::{Cell, RefCell},
     ffi::OsString,
     os::windows::ffi::OsStringExt,
@@ -13,9 +16,10 @@ use std::{
 
 use canvas::{Canvas, Preview, Scene};
 use chrome::{Label, Language, Message};
+use drawing::{COLORS, SHAPES};
 use image::{DynamicImage, ImageReader};
 use pdf::{Document, Mark, Point, Result};
-use pdfium_render::prelude::Pdfium;
+use pdfium_render::prelude::{PdfColor, Pdfium};
 use windows::{
     Win32::{
         Foundation::*,
@@ -47,6 +51,8 @@ const SIGN: u16 = 124;
 const PNG: u16 = 125;
 const UNDO: u16 = 126;
 const ERASE: u16 = 127;
+const SHAPE: u16 = 128;
+const COLOR: u16 = 129;
 const ZOOM_PICKER: u16 = 130;
 const THEME: u16 = 131;
 const MENU_FILE: u16 = 140;
@@ -55,6 +61,7 @@ const MENU_TOOLS: u16 = 142;
 const MENU_LANGUAGE: u16 = 143;
 const INDONESIAN: u16 = 144;
 const ENGLISH: u16 = 145;
+const PAGE_PICKER: u16 = 146;
 const MENU_ROW: i32 = 28;
 const MENU_BUTTONS: &[(u16, Label)] = &[
     (MENU_FILE, ("File", "File")),
@@ -163,6 +170,8 @@ const TOOLS: &[(u16, Label)] = &[
     (SIGN, ("&Gambar tanda tangan", "&Draw signature")),
     (PNG, ("I&mpor tanda tangan PNG…", "&Import PNG signature…")),
     (ERASE, ("&Hapus objek", "&Erase object")),
+    (SHAPE, ("&Bentuk…", "S&hape…")),
+    (COLOR, ("&Warna…", "&Color…")),
     (
         UNDO,
         (
@@ -206,6 +215,7 @@ struct App {
     resizing: bool,
     zoom: Option<u16>,
     zoom_picker: HWND,
+    page_picker: HWND,
     drag: Option<Drag>,
     selected_highlight: Option<(usize, (Point, Point))>,
     highlight_band: (f32, f32),
@@ -215,6 +225,8 @@ struct App {
     size: Point,
     page_rect: D2D_RECT_F,
     tool: u16,
+    colors: [usize; 4],
+    shape: usize,
     gesture: Vec<Point>,
     signature: Option<DynamicImage>,
     notice: Option<String>,
@@ -247,6 +259,7 @@ impl App {
             resizing: false,
             zoom: None,
             zoom_picker: HWND::default(),
+            page_picker: HWND::default(),
             drag: None,
             selected_highlight: None,
             highlight_band: (0.0, 0.0),
@@ -256,6 +269,8 @@ impl App {
             size: (0.0, 0.0),
             page_rect: D2D_RECT_F::default(),
             tool: READ,
+            colors: [0, 0, 1, 0],
+            shape: 0,
             gesture: Vec::new(),
             signature: None,
             notice: None,
@@ -298,12 +313,15 @@ impl App {
 
             MoveWindow(
                 self.status,
-                px(22),
+                px(if self.doc.is_some() { 152 } else { 22 }),
                 (h - self.footer).max(0),
-                (w - px(186)).max(0),
+                (w - px(if self.doc.is_some() { 310 } else { 186 })).max(0),
                 self.footer,
                 true,
             )?;
+            if !self.page_picker.is_invalid() {
+                page_picker::layout(self.page_picker, h, self.footer, dpi)?;
+            }
             MoveWindow(
                 self.zoom_picker,
                 (w - px(145)).max(0),
@@ -493,7 +511,7 @@ impl App {
         let action = chrome::font((15.0 * self.dpi).round() as i32, 600);
         let icons = chrome::icon_font((chrome::ICON_SIZE as f32 * self.dpi).round() as i32);
         unsafe {
-            for control in [self.status, self.editor, self.zoom_picker]
+            for control in [self.status, self.editor, self.zoom_picker, self.page_picker]
                 .into_iter()
                 .chain(
                     self.toolbar
@@ -706,22 +724,16 @@ impl App {
 
     fn sync(&self, hwnd: HWND) {
         let language = self.language;
-        let (title, page, dirty) = match &self.doc {
+        let (title, dirty) = match &self.doc {
             Some(doc) => {
                 let name = doc.source.file_name().unwrap_or_default().to_string_lossy();
                 let dirty = doc.dirty();
                 (
                     format!("{}{name} | HubbyPDF", if dirty { "* " } else { "" }),
-                    format!(
-                        "{} {} / {}",
-                        language.text(("Halaman", "Page")),
-                        doc.index + 1,
-                        doc.count()
-                    ),
                     dirty,
                 )
             }
-            None => ("HubbyPDF".into(), String::new(), false),
+            None => ("HubbyPDF".into(), false),
         };
         let hint = language.text(match self.tool {
             TEXT if self.text_at.is_some() => (
@@ -752,14 +764,15 @@ impl App {
                 "Klik objek tambahan untuk menghapusnya.",
                 "Click an object you added to erase it.",
             ),
+            SHAPE => ("Seret untuk menggambar.", "Drag to draw."),
             _ if dirty => ("Perubahan belum disimpan", "Unsaved changes"),
             _ => ("", ""),
         });
         let right = self.notice.as_deref().unwrap_or(hint);
-        let status = if page.is_empty() || right.is_empty() {
-            format!("{page}{right}")
+        let status = if self.tool == SHAPE && self.notice.is_none() {
+            format!("{} · {right}", language.text(SHAPES[self.shape].0))
         } else {
-            format!("{page}    |    {right}")
+            right.to_owned()
         };
         unsafe {
             let _ = SetWindowTextW(hwnd, PCWSTR(wide(&title).as_ptr()));
@@ -777,14 +790,16 @@ impl App {
                 },
             );
             let _ = EnableWindow(self.zoom_picker, self.doc.is_some());
+            page_picker::sync(self.page_picker, self.doc.as_ref());
             // Owner-drawn buttons can request a synchronous repaint during WM_SETTEXT.
             let _ = PostMessageW(hwnd, WM_SYNC_ZOOM_LABEL, WPARAM(0), LPARAM(0));
             for &(id, button) in &self.toolbar {
                 let enabled = matches!(id, OPEN | THEME)
-                    || self
-                        .doc
-                        .as_ref()
-                        .is_some_and(|doc| id != UNDO || doc.can_undo());
+                    || self.doc.as_ref().is_some_and(|doc| match id {
+                        UNDO => doc.can_undo(),
+                        COLOR => self.color_slot().is_some(),
+                        _ => true,
+                    });
                 let _ = EnableWindow(button, enabled);
                 repaint(button);
             }
@@ -799,6 +814,7 @@ impl App {
                         PREVIOUS => doc.index > 0,
                         NEXT => doc.index + 1 < doc.count(),
                         UNDO => doc.can_undo(),
+                        COLOR => self.color_slot().is_some(),
                         _ => true,
                     });
                 let _ = EnableMenuItem(
@@ -812,7 +828,7 @@ impl App {
                 THEME as u32,
                 (MF_BYCOMMAND | if self.dark { MF_CHECKED } else { MF_UNCHECKED }).0,
             );
-            for &(id, _) in TOOLS.iter().filter(|(id, _)| *id != UNDO) {
+            for &(id, _) in TOOLS.iter().filter(|(id, _)| !matches!(*id, UNDO | COLOR)) {
                 let _ = CheckMenuItem(
                     menu,
                     id as u32,
@@ -842,6 +858,7 @@ impl App {
     fn open(&mut self, hwnd: HWND, path: PathBuf) -> Result<()> {
         let doc = Document::open(self.engine, path)?;
         doc.size()?;
+        page_picker::populate(self.page_picker, doc.count())?;
         self.doc = Some(doc);
         unsafe {
             let _ = SetFocus(hwnd);
@@ -854,7 +871,81 @@ impl App {
         self.selected_highlight = None;
         self.text_at = None;
         self.pan = (0.0, 0.0);
+        self.resize(hwnd)
+    }
+
+    fn go_to_page(&mut self, hwnd: HWND, index: u16) -> Result<()> {
+        let Some(doc) = self.doc.as_mut() else {
+            return Ok(());
+        };
+        if index == doc.index || index >= doc.count() {
+            return Ok(());
+        }
+        doc.index = index;
+        self.notice = None;
+        self.gesture.clear();
+        self.drag = None;
+        self.selected_highlight = None;
+        self.text_at = None;
+        self.pan = (0.0, 0.0);
+        unsafe {
+            let _ = SetWindowTextW(self.editor, w!(""));
+        }
         self.refresh(hwnd)
+    }
+
+    fn color_slot(&self) -> Option<usize> {
+        match self.tool {
+            TEXT => Some(0),
+            SKETCH => Some(1),
+            SIGN => Some(2),
+            SHAPE => Some(3),
+            _ => None,
+        }
+    }
+
+    fn ink_color(&self) -> PdfColor {
+        self.color_slot()
+            .map_or(PdfColor::BLACK, |slot| COLORS[self.colors[slot]].1)
+    }
+
+    fn tool_options(
+        &self,
+        hwnd: HWND,
+        id: u16,
+        labels: impl Iterator<Item = Label>,
+        selected: usize,
+    ) -> Result<Option<usize>> {
+        let Some((_, button)) = self.toolbar.iter().find(|(tool, _)| *tool == id) else {
+            return Ok(None);
+        };
+        unsafe {
+            let mut anchor = RECT::default();
+            GetWindowRect(*button, &mut anchor)?;
+            let menu = CreatePopupMenu()?;
+            let result = (|| -> Result<i32> {
+                for (index, label) in labels.enumerate() {
+                    let label = wide(self.language.text(label));
+                    let check = if index == selected {
+                        MF_CHECKED
+                    } else {
+                        MF_UNCHECKED
+                    };
+                    AppendMenuW(menu, MF_STRING | check, index + 1, PCWSTR(label.as_ptr()))?;
+                }
+                Ok(TrackPopupMenuEx(
+                    menu,
+                    (TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN).0,
+                    anchor.left,
+                    anchor.bottom,
+                    hwnd,
+                    None,
+                )
+                .0)
+            })();
+            let _ = DestroyMenu(menu);
+            Ok(usize::try_from(result? - 1).ok())
+        }
     }
 
     fn discard_allowed(&self, hwnd: HWND) -> bool {
@@ -932,6 +1023,45 @@ impl App {
             }
             return Ok(());
         }
+        if id == COLOR {
+            if let Some(slot) = self.color_slot()
+                && let Some(color) = self.tool_options(
+                    hwnd,
+                    COLOR,
+                    COLORS.iter().map(|item| item.0),
+                    self.colors[slot],
+                )?
+            {
+                self.colors[slot] = color;
+                repaint(hwnd);
+                unsafe {
+                    let _ = SetFocus(if self.text_at.is_some() {
+                        self.editor
+                    } else {
+                        hwnd
+                    });
+                }
+            }
+            return Ok(());
+        }
+        if id == SHAPE && self.doc.is_some() {
+            let Some(shape) =
+                self.tool_options(hwnd, SHAPE, SHAPES.iter().map(|item| item.0), self.shape)?
+            else {
+                return Ok(());
+            };
+            self.shape = shape;
+        }
+        if let Some(doc) = &self.doc
+            && matches!(id, PREVIOUS | NEXT)
+        {
+            let index = if id == PREVIOUS {
+                doc.index.saturating_sub(1)
+            } else {
+                (doc.index + 1).min(doc.count() - 1)
+            };
+            return self.go_to_page(hwnd, index);
+        }
         let Some(doc) = self.doc.as_mut() else {
             return Ok(());
         };
@@ -939,7 +1069,7 @@ impl App {
         self.drag = None;
         if matches!(
             id,
-            PREVIOUS | NEXT | UNDO | READ | TEXT | HIGHLIGHT | SKETCH | SIGN | ERASE
+            UNDO | READ | TEXT | HIGHLIGHT | SKETCH | SIGN | ERASE | SHAPE
         ) {
             self.selected_highlight = None;
             self.text_at = None;
@@ -962,15 +1092,6 @@ impl App {
                             .into(),
                     );
                 }
-            }
-            PREVIOUS | NEXT => {
-                doc.index = if id == PREVIOUS {
-                    doc.index.saturating_sub(1)
-                } else {
-                    (doc.index + 1).min(doc.count() - 1)
-                };
-                self.pan = (0.0, 0.0);
-                self.refresh(hwnd)?;
             }
             ZOOM_OUT | ZOOM_IN | FIT => {
                 let current = self
@@ -1025,7 +1146,7 @@ impl App {
                     }
                 }
             }
-            READ | TEXT | HIGHLIGHT | SKETCH | SIGN | ERASE => {
+            READ | TEXT | HIGHLIGHT | SKETCH | SIGN | ERASE | SHAPE => {
                 if id == SIGN && self.tool != SIGN {
                     self.signature_group += 1;
                 }
@@ -1105,7 +1226,11 @@ impl App {
         }
         let (a, b) = (self.gesture[0], *self.gesture.last()?);
         match self.tool {
-            SKETCH | SIGN => Some(Preview::Ink(&self.gesture, self.tool == SIGN)),
+            SKETCH | SIGN => Some(Preview::Ink(Cow::Borrowed(&self.gesture), self.ink_color())),
+            SHAPE => Some(Preview::Ink(
+                Cow::Owned(SHAPES[self.shape].1.points(a, b, self.size)),
+                self.ink_color(),
+            )),
             HIGHLIGHT => {
                 let (a, b) = self.highlight_bounds(a, b);
                 Some(Preview::Box(a, b, true))
@@ -1162,7 +1287,7 @@ impl App {
             ))
             .into());
         }
-        self.add(hwnd, Mark::Text(point, text))?;
+        self.add(hwnd, Mark::Text(point, text, self.ink_color()))?;
         unsafe { SetWindowTextW(self.editor, w!(""))? };
         self.command(hwnd, READ)
     }
@@ -1192,8 +1317,19 @@ impl App {
         match self.tool {
             SKETCH | SIGN if points.windows(2).any(|pair| pair[0] != pair[1]) => self.add(
                 hwnd,
-                Mark::Ink(points, (self.tool == SIGN).then_some(self.signature_group)),
+                Mark::Ink(
+                    points,
+                    (self.tool == SIGN).then_some(self.signature_group),
+                    self.ink_color(),
+                ),
             )?,
+            SHAPE
+                if ((end.0 - start.0) * self.size.0).hypot((end.1 - start.1) * self.size.1)
+                    >= 1.0 =>
+            {
+                let shape = SHAPES[self.shape].1.points(start, end, self.size);
+                self.add(hwnd, Mark::Ink(shape, None, self.ink_color()))?;
+            }
             HIGHLIGHT if (start.0 - end.0).abs() * self.size.0 >= 1.0 => {
                 let (a, b) = self.highlight_bounds(start, end);
                 self.add(hwnd, Mark::Highlight(a, b))?;
@@ -1362,6 +1498,18 @@ fn process_message(
             return Ok(true);
         }
         WM_COMMAND if wparam.0 as u16 == ZOOM_PICKER => app.show_zoom_menu(hwnd)?,
+        WM_COMMAND if wparam.0 as u16 == PAGE_PICKER => {
+            let event = (wparam.0 >> 16) as u32;
+            let dropped = unsafe {
+                SendMessageW(app.page_picker, CB_GETDROPPEDSTATE, WPARAM(0), LPARAM(0)).0 != 0
+            };
+            if (event == CBN_SELENDOK || event == CBN_SELCHANGE && !dropped)
+                && let Some(index) = page_picker::selection(app.page_picker)
+            {
+                app.go_to_page(hwnd, index)?;
+            }
+            return Ok(true);
+        }
         WM_COMMAND if wparam.0 as u16 >= OPEN => app.command(hwnd, wparam.0 as u16)?,
         WM_CLOSE => app.command(hwnd, EXIT)?,
         WM_PAINT => {
@@ -1503,7 +1651,7 @@ fn process_message(
         }
         WM_MOUSEMOVE if !app.gesture.is_empty() => {
             if let Some(point) = app.point(lparam, true) {
-                if app.tool == HIGHLIGHT || app.tool == PNG {
+                if matches!(app.tool, HIGHLIGHT | PNG | SHAPE) {
                     app.gesture.truncate(1);
                 }
                 if app.gesture.last() != Some(&point) {
@@ -1595,15 +1743,21 @@ extern "system" fn window_proc(
             if let Ok(state) = state.try_borrow()
                 && let Some(app) = state.as_ref()
             {
-                chrome::draw_button(
-                    item,
-                    app.tool == item.CtlID as u16 || (item.CtlID == THEME as u32 && app.dark),
-                    item.hwndItem == app.open_button,
-                    app.dpi,
-                    app.contrast,
-                    app.dark,
-                    app.icon_font,
-                );
+                if item.CtlID == PAGE_PICKER as u32 {
+                    if let Some(doc) = &app.doc {
+                        page_picker::draw(item, doc, app.language, app.dpi, app.dark, app.contrast);
+                    }
+                } else {
+                    chrome::draw_button(
+                        item,
+                        app.tool == item.CtlID as u16 || (item.CtlID == THEME as u32 && app.dark),
+                        item.hwndItem == app.open_button,
+                        app.dpi,
+                        app.contrast,
+                        app.dark,
+                        app.icon_font,
+                    );
+                }
             }
         });
         return LRESULT(1);
@@ -1704,7 +1858,12 @@ fn keyboard(hwnd: HWND, message: &MSG) -> bool {
                 .iter()
                 .chain(&app.toolbar)
                 .map(|(_, button)| *button)
-                .chain([app.editor, app.open_button, app.zoom_picker])
+                .chain([
+                    app.editor,
+                    app.open_button,
+                    app.page_picker,
+                    app.zoom_picker,
+                ])
                 .filter(|control| unsafe {
                     IsWindowVisible(*control).as_bool() && IsWindowEnabled(*control).as_bool()
                 })
@@ -1728,6 +1887,9 @@ fn keyboard(hwnd: HWND, message: &MSG) -> bool {
             }
             app.sync(hwnd);
             return true;
+        }
+        if message.hwnd == app.page_picker && !ctrl {
+            return false;
         }
         let command = match (key, ctrl, editing) {
             (VIRTUAL_KEY(0x4F), true, _) => OPEN,
@@ -1944,6 +2106,7 @@ fn run(language: Language) -> Result<()> {
             instance,
             None,
         )?;
+        app.page_picker = page_picker::create(hwnd)?;
         for &(id, _, _) in chrome::TOOLS {
             let button = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
@@ -2015,7 +2178,7 @@ fn main() {
 }
 
 #[cfg(test)]
-fn verify_window_controls(engine: &'static Pdfium) -> Result<()> {
+fn verify_window_controls(engine: &'static Pdfium, source: &Path) -> Result<()> {
     unsafe {
         let instance = GetModuleHandleW(None)?;
         let parent = CreateWindowExW(
@@ -2051,6 +2214,9 @@ fn verify_window_controls(engine: &'static Pdfium) -> Result<()> {
         app.status = button;
         app.editor = button;
         app.open_button = button;
+        app.page_picker = page_picker::create(parent)?;
+        app.doc = Some(Document::open(engine, source.to_owned())?);
+        page_picker::populate(app.page_picker, app.doc.as_ref().unwrap().count())?;
         for &(id, _, _) in chrome::TOOLS {
             let tool = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
@@ -2071,6 +2237,21 @@ fn verify_window_controls(engine: &'static Pdfium) -> Result<()> {
         app.update_fonts(parent);
         app.set_language(Language::Indonesian)?;
         app.resize(parent)?;
+        page_picker::sync(app.page_picker, app.doc.as_ref());
+        assert_eq!(page_picker::selection(app.page_picker), Some(0));
+        assert_eq!(
+            SendMessageW(app.page_picker, CB_GETCOUNT, WPARAM(0), LPARAM(0)).0,
+            2
+        );
+        SendMessageW(app.page_picker, CB_SETCURSEL, WPARAM(1), LPARAM(0));
+        assert!(process_message(
+            &mut app,
+            parent,
+            WM_COMMAND,
+            WPARAM((CBN_SELENDOK as usize) << 16 | PAGE_PICKER as usize),
+            LPARAM(0),
+        )?);
+        assert_eq!(app.doc.as_ref().unwrap().index, 1);
         APP.with(|state| *state.borrow_mut() = Some(app));
         let mut indonesian_sign_width = 0;
         for (language, zoom, expected) in [
@@ -2099,11 +2280,11 @@ fn verify_window_controls(engine: &'static Pdfium) -> Result<()> {
                 };
                 let sign = tool_rect(SIGN);
                 let sketch = tool_rect(SKETCH);
-                let png = tool_rect(PNG);
+                let shape = tool_rect(SHAPE);
                 let gap = (3.0 * app.dpi).round() as i32;
-                assert_eq!(sign.top, png.top);
+                assert_eq!(sign.top, shape.top);
                 assert_eq!(sign.left - sketch.right, gap);
-                assert_eq!(png.left - sign.right, gap);
+                assert_eq!(shape.left - sign.right, gap);
                 if language == Language::Indonesian {
                     indonesian_sign_width = sign.right - sign.left;
                 } else {

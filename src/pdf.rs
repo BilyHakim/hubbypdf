@@ -24,16 +24,16 @@ pub struct Raster {
 }
 
 pub enum Mark {
-    Ink(Vec<Point>, Option<u64>),
+    Ink(Vec<Point>, Option<u64>, PdfColor),
     Highlight(Point, Point),
-    Text(Point, String),
+    Text(Point, String, PdfColor),
     Signature(Point, Point, DynamicImage),
 }
 
 impl Mark {
     fn bounds(&self) -> Option<(Point, Point)> {
         let points = match self {
-            Self::Ink(points, _) => points.as_slice(),
+            Self::Ink(points, _, _) => points.as_slice(),
             Self::Highlight(a, b) | Self::Signature(a, b, _) => {
                 return Some(((a.0.min(b.0), a.1.min(b.1)), (a.0.max(b.0), a.1.max(b.1))));
             }
@@ -135,6 +135,21 @@ impl Document {
 
     pub fn render(&self, width: i32, height: i32) -> Result<Raster> {
         let page = self.pdf.pages().get(self.index)?;
+        Self::rasterize(&page, width, height)
+    }
+
+    pub fn thumbnail(&self, index: u16, width: i32, height: i32) -> Result<Raster> {
+        let page = self.pdf.pages().get(index)?;
+        let (w, h) = Self::page_size(&page)?;
+        let scale = (width as f32 / w).min(height as f32 / h);
+        Self::rasterize(
+            &page,
+            (w * scale).round().max(1.0) as i32,
+            (h * scale).round().max(1.0) as i32,
+        )
+    }
+
+    fn rasterize(page: &PdfPage<'_>, width: i32, height: i32) -> Result<Raster> {
         let bitmap = page.render_with_config(&Self::config(width, height))?;
         Ok(Raster {
             width: bitmap.width(),
@@ -216,18 +231,13 @@ impl Document {
         };
         let mut selection_bounds = mark.bounds();
         let object: PdfPageObject = match mark {
-            Mark::Ink(points, signature) => {
+            Mark::Ink(points, _, color) => {
                 let (x, y) = to_pdf(points[0])?;
-                let color = if signature.is_some() {
-                    PdfColor::BLUE
-                } else {
-                    PdfColor::BLACK
-                };
                 let mut path = PdfPagePathObject::new(
                     pdf,
                     x,
                     y,
-                    Some(color),
+                    Some(*color),
                     Some(PdfPoints::new(1.8)),
                     None,
                 )?;
@@ -255,9 +265,10 @@ impl Document {
                 )?
                 .into()
             }
-            Mark::Text(at, text) => {
+            Mark::Text(at, text, color) => {
                 let mut object =
                     PdfPageTextObject::new(pdf, text, font.unwrap(), PdfPoints::new(14.0))?;
+                object.set_fill_color(*color)?;
                 let bounds = object.bounds()?;
                 let width = bounds.width().value / page_size.0;
                 let height = bounds.height().value / page_size.1;
@@ -377,7 +388,7 @@ impl Document {
                 && point.1 >= a.1 - tolerance.1
                 && point.1 <= b.1 + tolerance.1
                 && match mark {
-                    Mark::Ink(points, _) if precise_ink => Self::near_stroke(
+                    Mark::Ink(points, _, _) if precise_ink => Self::near_stroke(
                         points,
                         translate(
                             point,
@@ -389,9 +400,9 @@ impl Document {
                 }
         })?;
         let mut ids = vec![id];
-        if let Mark::Ink(_, Some(group)) = mark {
+        if let Mark::Ink(_, Some(group), _) = mark {
             for (other, mark, left, right) in marks {
-                if other != id && matches!(mark, Mark::Ink(_, Some(g)) if g == group) {
+                if other != id && matches!(mark, Mark::Ink(_, Some(g), _) if g == group) {
                     ids.push(other);
                     a = (a.0.min(left.0), a.1.min(left.1));
                     b = (b.0.max(right.0), b.1.max(right.1));
@@ -545,7 +556,6 @@ mod tests {
             &folder.join("vendor/pdfium/bin"),
             crate::chrome::Language::Indonesian,
         )?));
-        crate::verify_window_controls(engine)?;
         let work = folder.join("target/pdf-smoke");
         fs::create_dir_all(&work)?;
         let source = work.join("sumber.pdf");
@@ -555,8 +565,12 @@ mod tests {
             blank
                 .pages_mut()
                 .create_page_at_end(PdfPagePaperSize::a4())?;
+            blank
+                .pages_mut()
+                .create_page_at_end(PdfPagePaperSize::a4().landscape())?;
             blank.save_to_file(&source)?;
         }
+        crate::verify_window_controls(engine, &source)?;
         let original = fs::read(&source)?;
         let mut doc = Document::open(engine, source.clone())?;
         let rendered = doc.render(420, 594)?;
@@ -565,7 +579,11 @@ mod tests {
             (rendered.width * rendered.height * 4) as usize
         );
 
-        doc.add(Mark::Text((0.10, 0.60), "Uji HubbyPDF".into()))?;
+        doc.add(Mark::Text(
+            (0.10, 0.60),
+            "Uji HubbyPDF".into(),
+            PdfColor::RED,
+        ))?;
         let (top, bottom) = doc.highlight_band((0.12, 0.605))?;
         let (_, page_height) = doc.size()?;
         assert!(top < 0.605 && bottom > 0.605);
@@ -576,10 +594,12 @@ mod tests {
         doc.add(Mark::Ink(
             vec![(0.15, 0.25), (0.3, 0.30), (0.4, 0.26)],
             None,
+            PdfColor::BLACK,
         ))?;
         doc.add(Mark::Ink(
             vec![(0.20, 0.40), (0.25, 0.43), (0.34, 0.37)],
             Some(1),
+            PdfColor::BLUE,
         ))?;
         doc.add(Mark::Highlight((0.09, 0.18), (0.25, 0.21)))?;
         let rgba = image::RgbaImage::from_pixel(10, 4, image::Rgba([20, 40, 180, 150]));
@@ -653,6 +673,8 @@ mod tests {
         assert_eq!(page.objects().len(), 4);
 
         assert!(page.text()?.all().contains("Uji HubbyPDF"));
+        let fill = page.objects().get(0)?.fill_color()?;
+        assert_eq!((fill.red(), fill.green(), fill.blue()), (255, 0, 0));
         assert!(page.objects().get(0)?.bounds()?.left().value > 280.0);
 
         doc.undo()?;
@@ -665,6 +687,23 @@ mod tests {
         assert_eq!(doc.pdf.pages().get(0)?.objects().len(), 5);
         doc.undo()?;
         assert_eq!(doc.pdf.pages().get(0)?.objects().len(), 4);
+        let first = doc.thumbnail(0, 52, 72)?;
+        assert!(first.height > first.width);
+        let second = doc.thumbnail(1, 52, 72)?;
+        assert!(second.width > second.height);
+        assert_eq!(doc.index, 0);
+        doc.index = 1;
+        let tail = (0.2, 0.4);
+        let tip = (0.7, 0.4);
+        let points = crate::drawing::Shape::Arrow.points(tail, tip, doc.size()?);
+        assert!(points[2].0 < tip.0 && points[2].1 > tip.1 && points[4].1 < tip.1);
+        doc.add(Mark::Ink(points, None, PdfColor::BLUE))?;
+        let marked = doc.thumbnail(1, 52, 72)?;
+        assert_ne!(marked.bytes, second.bytes);
+        assert!(doc.erase_at((0.5, 0.4), tolerance)?);
+        assert_eq!(doc.thumbnail(1, 52, 72)?.bytes, second.bytes);
+        doc.undo()?;
+        assert_eq!(doc.thumbnail(1, 52, 72)?.bytes, marked.bytes);
         Ok(())
     }
 }

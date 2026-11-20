@@ -10,7 +10,10 @@ Jalankan `target/HubbyPDF/HubbyPDF.exe`. Jika dipindahkan ke komputer lain, sali
 - Pilih **Bahasa → Bahasa Indonesia** atau **Bahasa → English**. HubbyPDF mengingat pilihan bahasa.
 - **File → Buka PDF** atau **Ctrl+O**. Anda juga bisa memberikan path PDF sebagai argumen.
 - Pilih zoom **25%–500%** atau **Pas jendela** di kanan bawah. **100%** berarti ukuran aktual PDF pada skala Windows. Gunakan **Page Up / Page Down** untuk pindah halaman, **Ctrl+roda mouse** untuk zoom, dan **tombol panah** untuk menggeser halaman yang lebih besar dari area baca.
+- Klik nomor halaman di kiri bawah untuk membuka daftar dengan mini preview, lalu pilih halaman yang ingin dibuka.
 - Klik **Teks**, lalu klik posisi pada halaman. Ketik teks Latin dasar berukuran 14 pt dan tekan **Enter** untuk menempatkannya. **Esc** membatalkan teks yang masih diketik.
+- Pilih **Warna** setelah mengaktifkan **Teks**, **Sketsa**, **Tanda tangan**, atau **Bentuk**. Tiap alat mengingat warna terakhirnya selama aplikasi terbuka.
+- Buka **Bentuk**, pilih persegi panjang, elips, garis, atau panah, lalu seret di halaman. Untuk panah, titik lepas mouse menentukan letak ujung panah.
 - **Sorot**, **Sketsa**, dan **Tanda tangan** menggunakan gerakan seret. Dengan **Impor PNG**, seret secara diagonal untuk mengatur posisi dan ukuran. Gambar yang sisi terpanjangnya melebihi 1.024 piksel diperkecil saat impor.
 - Klik **Pilih**, lalu seret teks tambahan, sorotan, sketsa, atau tanda tangan yang dibuat dalam sesi ini. Goresan yang dibuat dalam satu penggunaan mode Tanda tangan ikut digeser bersama. Untuk memindahkan objek lagi, tetap gunakan dokumen yang sedang terbuka. Salinan PDF menyimpan posisi akhir sebagai konten halaman.
 - Klik **Hapus**, lalu klik teks tambahan, sorotan, goresan sketsa, atau tanda tangan yang dibuat pada dokumen yang sedang terbuka. Klik salah satu goresan tanda tangan untuk menghapus seluruh tanda tangan. **Ctrl+Z** mengembalikan objek yang terakhir dihapus.

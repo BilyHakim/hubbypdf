@@ -38,7 +38,7 @@ pub struct Scene<'a> {
 
 pub enum Preview<'a> {
     Selection(Point, Point, bool),
-    Ink(&'a [Point], bool),
+    Ink(Cow<'a, [Point]>, PdfColor),
     Box(Point, Point, bool),
 }
 
@@ -159,10 +159,13 @@ impl Canvas {
             if let Some(preview) = scene.preview {
                 brush.SetColor(&hex(0x213347));
                 match preview {
-                    Preview::Ink(points, signature) => {
-                        if signature {
-                            brush.SetColor(&color(0.0, 0.22, 0.75, 1.0));
-                        }
+                    Preview::Ink(points, ink) => {
+                        brush.SetColor(&color(
+                            f32::from(ink.red()) / 255.0,
+                            f32::from(ink.green()) / 255.0,
+                            f32::from(ink.blue()) / 255.0,
+                            1.0,
+                        ));
                         for pair in points.windows(2) {
                             self.target.DrawLine(
                                 to_screen(pair[0]),
@@ -422,3 +425,6 @@ fn gradient(target: &ID2D1HwndRenderTarget, colors: [u32; 3]) -> Result<ID2D1Lin
         target.CreateLinearGradientBrush(&Default::default(), None, &stops)
     }
 }
+use std::borrow::Cow;
+
+use pdfium_render::prelude::PdfColor;

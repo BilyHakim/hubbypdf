@@ -62,6 +62,8 @@ pub const TOOLS: &[(u16, Label, u16)] = &[
     (super::HIGHLIGHT, ("Sorot", "Highlight"), 0xe7e6),
     (super::SKETCH, ("Sketsa", "Sketch"), 0xed63),
     (super::SIGN, ("Tanda tangan", "Sign"), 0xe70f),
+    (super::SHAPE, ("Bentuk ▾", "Shape ▾"), 0xe91b),
+    (super::COLOR, ("Warna ▾", "Color ▾"), 0xe790),
     (super::PNG, ("Impor PNG", "Import PNG"), 0xe8b9),
     (super::ERASE, ("Hapus", "Erase"), 0xe75c),
     (super::UNDO, ("Undo", "Undo"), 0xe7a7),
