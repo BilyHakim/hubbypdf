@@ -84,21 +84,40 @@ struct Drag {
     start: Point,
     bounds: (Point, Point),
     delta: Point,
+    edge: Option<HighlightEdge>,
+}
+
+#[derive(Clone, Copy)]
+enum HighlightEdge {
+    Top,
+    Bottom,
 }
 
 impl Drag {
     fn update(&mut self, point: Point) {
         let (a, b) = self.bounds;
-        self.delta = (
-            (point.0 - self.start.0).clamp(-a.0, 1.0 - b.0),
-            (point.1 - self.start.1).clamp(-a.1, 1.0 - b.1),
-        );
+        let dy = point.1 - self.start.1;
+        let room = (b.1 - a.1 - 0.001).max(0.0);
+        self.delta = match self.edge {
+            Some(HighlightEdge::Top) => (0.0, dy.clamp(-a.1, room)),
+            Some(HighlightEdge::Bottom) => (0.0, dy.clamp(-room, 1.0 - b.1)),
+            None => (
+                (point.0 - self.start.0).clamp(-a.0, 1.0 - b.0),
+                dy.clamp(-a.1, 1.0 - b.1),
+            ),
+        };
     }
 
     fn translated(&self) -> (Point, Point) {
         (
-            pdf::translate(self.bounds.0, self.delta),
-            pdf::translate(self.bounds.1, self.delta),
+            match self.edge {
+                Some(HighlightEdge::Bottom) => self.bounds.0,
+                _ => pdf::translate(self.bounds.0, self.delta),
+            },
+            match self.edge {
+                Some(HighlightEdge::Top) => self.bounds.1,
+                _ => pdf::translate(self.bounds.1, self.delta),
+            },
         )
     }
 }
@@ -156,6 +175,8 @@ struct App {
     zoom: Option<u16>,
     zoom_picker: HWND,
     drag: Option<Drag>,
+    selected_highlight: Option<(usize, (Point, Point))>,
+    highlight_band: (f32, f32),
     text_at: Option<Point>,
     signature_group: u64,
     pan: Point,
@@ -194,6 +215,8 @@ impl App {
             zoom: None,
             zoom_picker: HWND::default(),
             drag: None,
+            selected_highlight: None,
+            highlight_band: (0.0, 0.0),
             text_at: None,
             signature_group: 0,
             pan: (0.0, 0.0),
@@ -610,7 +633,7 @@ impl App {
             }
             TEXT => "Klik posisi teks pada halaman.",
             READ if self.doc.is_some() && !dirty => "Seret objek untuk menggeser.",
-            HIGHLIGHT => "Sorot · Seret untuk menandai area.",
+            HIGHLIGHT => "Sorot · Seret mendatar, lalu tarik pegangan untuk mengubah tinggi.",
             SKETCH => "Sketsa · Gambar di halaman.",
             SIGN => "Tanda tangan · Gambar di halaman.",
             PNG => "Tanda tangan PNG · Seret untuk menentukan ukuran, atau tekan Enter.",
@@ -702,6 +725,7 @@ impl App {
         self.gesture.clear();
         self.zoom = None;
         self.drag = None;
+        self.selected_highlight = None;
         self.text_at = None;
         self.pan = (0.0, 0.0);
         self.refresh(hwnd)
@@ -755,6 +779,7 @@ impl App {
             id,
             PREVIOUS | NEXT | UNDO | READ | TEXT | HIGHLIGHT | SKETCH | SIGN
         ) {
+            self.selected_highlight = None;
             self.text_at = None;
             unsafe {
                 let _ = SetWindowTextW(self.editor, w!(""));
@@ -826,6 +851,7 @@ impl App {
                         image
                     });
                     self.text_at = None;
+                    self.selected_highlight = None;
                     self.tool = PNG;
                     unsafe {
                         let _ = SetFocus(hwnd);
@@ -873,22 +899,43 @@ impl App {
         }
     }
 
+    fn highlight_handle(&self, point: Point) -> Option<HighlightEdge> {
+        let (_, (a, b)) = self.selected_highlight?;
+        let rect = self.page_rect;
+        let radius = 6.0 * self.dpi;
+        let dx = (point.0 - (a.0 + b.0) / 2.0).abs() * (rect.right - rect.left);
+        let top = (point.1 - a.1).abs() * (rect.bottom - rect.top);
+        let bottom = (point.1 - b.1).abs() * (rect.bottom - rect.top);
+        (dx <= radius && top.min(bottom) <= radius).then_some(if top <= bottom {
+            HighlightEdge::Top
+        } else {
+            HighlightEdge::Bottom
+        })
+    }
+
+    fn highlight_bounds(&self, start: Point, end: Point) -> (Point, Point) {
+        let (top, bottom) = self.highlight_band;
+        ((start.0.min(end.0), top), (start.0.max(end.0), bottom))
+    }
+
     fn preview(&self) -> Option<Preview<'_>> {
         if let Some(drag) = &self.drag {
             let (a, b) = drag.translated();
-            return Some(Preview::Selection(a, b));
+            return Some(Preview::Selection(a, b, self.selected_highlight.is_some()));
         }
         if self.gesture.len() < 2 {
-            return None;
+            return self
+                .selected_highlight
+                .map(|(_, (a, b))| Preview::Selection(a, b, true));
         }
         let (a, b) = (self.gesture[0], *self.gesture.last()?);
         match self.tool {
             SKETCH | SIGN => Some(Preview::Ink(&self.gesture, self.tool == SIGN)),
-            HIGHLIGHT | PNG => Some(Preview::Box(
-                a,
-                self.signature_end(a, b),
-                self.tool == HIGHLIGHT,
-            )),
+            HIGHLIGHT => {
+                let (a, b) = self.highlight_bounds(a, b);
+                Some(Preview::Box(a, b, true))
+            }
+            PNG => Some(Preview::Box(a, self.signature_end(a, b), false)),
             _ => None,
         }
     }
@@ -944,7 +991,14 @@ impl App {
     fn add(&mut self, hwnd: HWND, mark: Mark) -> Result<()> {
         self.notice = None;
         if let Some(doc) = self.doc.as_mut() {
-            doc.add(mark)?;
+            let bounds = match &mark {
+                Mark::Highlight(a, b) => Some((*a, *b)),
+                _ => None,
+            };
+            let id = doc.add(mark)?;
+            if let Some(bounds) = bounds {
+                self.selected_highlight = Some((id, bounds));
+            }
             self.refresh(hwnd)?;
         }
         Ok(())
@@ -961,8 +1015,9 @@ impl App {
                 hwnd,
                 Mark::Ink(points, (self.tool == SIGN).then_some(self.signature_group)),
             )?,
-            HIGHLIGHT if start.0 != end.0 && start.1 != end.1 => {
-                self.add(hwnd, Mark::Highlight(start, end))?
+            HIGHLIGHT if (start.0 - end.0).abs() * self.size.0 >= 1.0 => {
+                let (a, b) = self.highlight_bounds(start, end);
+                self.add(hwnd, Mark::Highlight(a, b))?;
             }
             PNG => self.place_signature(hwnd, start, end)?,
             _ => {}
@@ -1148,9 +1203,21 @@ fn process_message(
         }
         WM_LBUTTONDOWN => {
             if let Some(point) = app.point(lparam, false) {
-                if app.tool == TEXT {
+                if let Some(edge) = app.highlight_handle(point)
+                    && let Some((id, bounds)) = app.selected_highlight
+                {
+                    app.drag = Some(Drag {
+                        ids: vec![id],
+                        start: point,
+                        bounds,
+                        delta: (0.0, 0.0),
+                        edge: Some(edge),
+                    });
+                    unsafe { SetCapture(hwnd) };
+                } else if app.tool == TEXT {
                     app.begin_text(hwnd, point);
                 } else if app.tool == READ {
+                    app.selected_highlight = None;
                     let r = app.page_rect;
                     let tolerance = (
                         7.0 * app.dpi / (r.right - r.left),
@@ -1159,23 +1226,34 @@ fn process_message(
                     if let Some((ids, bounds)) =
                         app.doc.as_ref().and_then(|doc| doc.hit(point, tolerance))
                     {
+                        if app.doc.as_ref().is_some_and(|doc| doc.is_highlight(ids[0])) {
+                            app.selected_highlight = Some((ids[0], bounds));
+                        }
                         app.drag = Some(Drag {
                             ids,
                             start: point,
                             bounds,
                             delta: (0.0, 0.0),
+                            edge: None,
                         });
                         unsafe {
                             SetCapture(hwnd);
                         }
-                        repaint(hwnd);
                     }
+                    repaint(hwnd);
                 } else {
+                    if app.tool == HIGHLIGHT
+                        && let Some(doc) = &app.doc
+                    {
+                        app.highlight_band = doc.highlight_band(point)?;
+                    }
+                    app.selected_highlight = None;
                     app.gesture.clear();
                     app.gesture.push(point);
                     unsafe {
                         SetCapture(hwnd);
                     }
+                    repaint(hwnd);
                 }
             }
         }
@@ -1198,7 +1276,19 @@ fn process_message(
                     && let Some(doc) = app.doc.as_mut()
                 {
                     drag.update(point);
-                    doc.move_mark(drag.ids, drag.delta)?;
+                    let bounds = drag.translated();
+                    match drag.edge {
+                        Some(HighlightEdge::Top) => {
+                            doc.resize_highlight(drag.ids[0], (drag.delta.1, 0.0))?
+                        }
+                        Some(HighlightEdge::Bottom) => {
+                            doc.resize_highlight(drag.ids[0], (0.0, drag.delta.1))?
+                        }
+                        None => doc.move_mark(drag.ids, drag.delta)?,
+                    }
+                    if let Some((_, selected)) = &mut app.selected_highlight {
+                        *selected = bounds;
+                    }
                     app.refresh(hwnd)?;
                 }
             }

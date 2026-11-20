@@ -36,7 +36,7 @@ pub struct Scene<'a> {
 }
 
 pub enum Preview<'a> {
-    Selection(Point, Point),
+    Selection(Point, Point, bool),
     Ink(&'a [Point], bool),
     Box(Point, Point, bool),
 }
@@ -172,15 +172,25 @@ impl Canvas {
                             );
                         }
                     }
-                    Preview::Selection(a, b) => {
+                    Preview::Selection(a, b, handles) => {
                         let (a, b) = (to_screen(a), to_screen(b));
-                        let pad = 4.0 * scene.dpi;
+                        let pad = if handles { 0.0 } else { 4.0 * scene.dpi };
                         let selection = bounds(a.x - pad, a.y - pad, b.x + pad, b.y + pad);
-                        brush.SetColor(&color(0.20, 0.31, 0.62, 0.16));
-                        self.target.FillRectangle(&selection, brush);
+                        if !handles {
+                            brush.SetColor(&color(0.20, 0.31, 0.62, 0.16));
+                            self.target.FillRectangle(&selection, brush);
+                        }
                         brush.SetColor(&hex(0x32498c));
                         self.target
                             .DrawRectangle(&selection, brush, 2.0 * scene.dpi, None);
+                        if handles {
+                            let x = (a.x + b.x) / 2.0;
+                            let radius = (3.5 * scene.dpi).min((b.y - a.y) * 0.45);
+                            for y in [a.y, b.y] {
+                                let handle = bounds(x - radius, y - radius, x + radius, y + radius);
+                                self.target.FillRectangle(&handle, brush);
+                            }
+                        }
                     }
                     Preview::Box(a, b, highlight) => {
                         let (a, b) = (to_screen(a), to_screen(b));

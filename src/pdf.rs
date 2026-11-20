@@ -52,6 +52,7 @@ pub fn translate(point: Point, offset: Point) -> Point {
 enum Edit {
     Add(Mark, Option<MarkBounds>),
     Move(Vec<usize>, Point),
+    ResizeHighlight(usize, (f32, f32)),
 }
 
 pub struct Document {
@@ -134,12 +135,58 @@ impl Document {
         })
     }
 
-    pub fn add(&mut self, mark: Mark) -> Result<()> {
+    pub fn highlight_band(&self, at: Point) -> Result<(f32, f32)> {
+        let page = self.pdf.pages().get(self.index)?;
+        let size = Self::page_size(&page)?;
+        let (w, h, config) = Self::edit_coordinates(size);
+        let (x, y) = page.pixels_to_points(
+            (at.0 * w as f32).round() as i32,
+            (at.1 * h as f32).round() as i32,
+            &config,
+        )?;
+        let text = page.text()?;
+        let chars = text.chars();
+        if let Some(glyph) =
+            chars.get_char_near_point(x, PdfPoints::new(8.0), y, PdfPoints::new(3.0))
+            && let Ok(bounds) = glyph.loose_bounds()
+        {
+            let (_, a) = page.points_to_pixels(bounds.left(), bounds.top(), &config)?;
+            let (_, b) = page.points_to_pixels(bounds.right(), bounds.bottom(), &config)?;
+            let center = (a + b) as f32 / (2.0 * h as f32);
+            let font_height = glyph.scaled_font_size().value / size.1;
+            let half = if font_height.is_finite() && font_height > 0.0 {
+                font_height / 2.0
+            } else {
+                a.abs_diff(b) as f32 / (2.0 * h as f32)
+            };
+            let band = ((center - half).max(0.0), (center + half).min(1.0));
+            if band.0 < band.1 {
+                return Ok(band);
+            }
+        }
+        let half = 6.0 / size.1;
+        Ok(((at.1 - half).max(0.0), (at.1 + half).min(1.0)))
+    }
+
+    fn edit_coordinates((w, h): Point) -> (i32, i32, PdfRenderConfig) {
+        let scale = 4096.0 / w.max(h);
+        let w = (w * scale).round().max(1.0) as i32;
+        let h = (h * scale).round().max(1.0) as i32;
+        (w, h, Self::config(w, h))
+    }
+
+    pub fn add(&mut self, mark: Mark) -> Result<usize> {
+        let mark = match mark {
+            Mark::Highlight(a, b) => {
+                Mark::Highlight((a.0.min(b.0), a.1.min(b.1)), (a.0.max(b.0), a.1.max(b.1)))
+            }
+            mark => mark,
+        };
         let bounds = Self::apply(&mut self.pdf, self.index, &mark, (0.0, 0.0))?;
         self.next_revision += 1;
         self.edits
             .push((self.index, Edit::Add(mark, bounds), self.next_revision));
-        Ok(())
+        Ok(self.edits.len() - 1)
     }
 
     fn apply(
@@ -150,14 +197,8 @@ impl Document {
     ) -> Result<Option<MarkBounds>> {
         let font = matches!(mark, Mark::Text(..)).then(|| pdf.fonts_mut().helvetica());
         let mut page = pdf.pages().get(index)?;
-        let (w, h) = Self::page_size(&page)?;
-        let page_size = (w, h);
-        let scale = 4096.0 / w.max(h);
-        let (w, h) = (
-            (w * scale).round().max(1.0) as i32,
-            (h * scale).round().max(1.0) as i32,
-        );
-        let config = Self::config(w, h);
+        let page_size = Self::page_size(&page)?;
+        let (w, h, config) = Self::edit_coordinates(page_size);
         let to_pdf = |(x, y): Point| {
             page.pixels_to_points(
                 ((x + offset.0) * w as f32).round() as i32,
@@ -254,17 +295,33 @@ impl Document {
         Ok(selection_bounds)
     }
 
-    fn offsets(edits: &[(u16, Edit, u64)]) -> HashMap<usize, Point> {
+    fn offsets(edits: &[(u16, Edit, u64)]) -> HashMap<usize, MarkBounds> {
         let mut offsets = HashMap::new();
         for (_, edit, _) in edits {
-            if let Edit::Move(ids, delta) = edit {
-                for id in ids {
-                    let entry = offsets.entry(*id).or_insert((0.0, 0.0));
-                    *entry = translate(*entry, *delta);
+            match edit {
+                Edit::Move(ids, delta) => {
+                    for id in ids {
+                        let (a, b) = offsets.entry(*id).or_default();
+                        *a = translate(*a, *delta);
+                        *b = translate(*b, *delta);
+                    }
                 }
+                Edit::ResizeHighlight(id, (top, bottom)) => {
+                    let (a, b) = offsets.entry(*id).or_default();
+                    a.1 += top;
+                    b.1 += bottom;
+                }
+                Edit::Add(..) => {}
             }
         }
         offsets
+    }
+
+    pub fn is_highlight(&self, id: usize) -> bool {
+        matches!(
+            self.edits.get(id),
+            Some((_, Edit::Add(Mark::Highlight(..), _), _))
+        )
     }
 
     pub fn hit(&self, point: Point, tolerance: Point) -> Option<(Vec<usize>, (Point, Point))> {
@@ -280,9 +337,9 @@ impl Document {
                 let Edit::Add(mark, bounds) = edit else {
                     return None;
                 };
-                let delta = offsets.get(&id).copied().unwrap_or_default();
+                let (top_left, bottom_right) = offsets.get(&id).copied().unwrap_or_default();
                 let (a, b) = (*bounds)?;
-                Some((id, mark, translate(a, delta), translate(b, delta)))
+                Some((id, mark, translate(a, top_left), translate(b, bottom_right)))
             });
         let (id, mark, mut a, mut b) = marks.clone().rev().find(|(_, _, a, b)| {
             point.0 >= a.0 - tolerance.0
@@ -307,9 +364,19 @@ impl Document {
         if delta == (0.0, 0.0) {
             return Ok(());
         }
+        self.update(Edit::Move(ids, delta))
+    }
+
+    pub fn resize_highlight(&mut self, id: usize, delta: (f32, f32)) -> Result<()> {
+        if delta == (0.0, 0.0) {
+            return Ok(());
+        }
+        self.update(Edit::ResizeHighlight(id, delta))
+    }
+
+    fn update(&mut self, edit: Edit) -> Result<()> {
         let revision = self.next_revision + 1;
-        self.edits
-            .push((self.index, Edit::Move(ids, delta), revision));
+        self.edits.push((self.index, edit, revision));
         match self.rebuild(self.edits.len()) {
             Ok(pdf) => {
                 self.pdf = pdf;
@@ -332,12 +399,17 @@ impl Document {
         let offsets = Self::offsets(edits);
         for (id, (index, edit, _)) in edits.iter().enumerate() {
             if let Edit::Add(mark, _) = edit {
-                Self::apply(
-                    &mut rebuilt,
-                    *index,
-                    mark,
-                    offsets.get(&id).copied().unwrap_or_default(),
-                )?;
+                let (a, b) = offsets.get(&id).copied().unwrap_or_default();
+                if let Mark::Highlight(start, end) = mark {
+                    Self::apply(
+                        &mut rebuilt,
+                        *index,
+                        &Mark::Highlight(translate(*start, a), translate(*end, b)),
+                        (0.0, 0.0),
+                    )?;
+                } else {
+                    Self::apply(&mut rebuilt, *index, mark, a)?;
+                }
             }
         }
         Ok(rebuilt)
@@ -418,6 +490,13 @@ mod tests {
         );
 
         doc.add(Mark::Text((0.10, 0.60), "Uji HubbyPDF".into()))?;
+        let (top, bottom) = doc.highlight_band((0.12, 0.605))?;
+        let (_, page_height) = doc.size()?;
+        assert!(top < 0.605 && bottom > 0.605);
+        let height = (bottom - top) * page_height;
+        assert!((13.9..17.0).contains(&height), "14 pt text band: {height}");
+        let (top, bottom) = doc.highlight_band((0.8, 0.605))?;
+        assert!(((bottom - top) * page_height - 12.0).abs() < 0.01);
         doc.add(Mark::Ink(
             vec![(0.15, 0.25), (0.3, 0.30), (0.4, 0.26)],
             None,
@@ -450,6 +529,18 @@ mod tests {
             doc.undo()?;
             assert_eq!(doc.render(420, 594)?.bytes, before);
         }
+        let (ids, _) = doc.hit((0.15, 0.19), (0.0, 0.0)).unwrap();
+        let before = doc.render(420, 594)?.bytes;
+        doc.resize_highlight(ids[0], (-0.02, 0.0))?;
+        doc.resize_highlight(ids[0], (0.0, 0.03))?;
+        assert_eq!(doc.hit((0.15, 0.17), (0.0, 0.0)).unwrap().0, ids);
+        assert_eq!(doc.hit((0.15, 0.23), (0.0, 0.0)).unwrap().0, ids);
+        assert_ne!(doc.render(420, 594)?.bytes, before);
+        doc.undo()?;
+        assert!(doc.hit((0.15, 0.23), (0.0, 0.0)).is_none());
+        doc.undo()?;
+        assert!(doc.hit((0.15, 0.17), (0.0, 0.0)).is_none());
+        assert_eq!(doc.render(420, 594)?.bytes, before);
         let (ids, _) = doc.hit((0.18, 0.47), (0.001, 0.001)).unwrap();
         doc.move_mark(ids, (0.4, 0.0))?;
         let (ids, _) = doc.hit((0.12, 0.605), (0.001, 0.001)).unwrap();
