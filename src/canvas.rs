@@ -29,6 +29,7 @@ pub struct Scene<'a> {
     pub page: D2D_RECT_F,
     pub viewport: D2D_RECT_F,
     pub dpi: f32,
+    pub language: chrome::Language,
     pub system_background: Option<D2D1_COLOR_F>,
     pub dark: bool,
     pub toolbar_dividers: &'a [(i32, i32)],
@@ -350,7 +351,12 @@ impl Canvas {
             self.brush
                 .SetColor(&hex(if scene.dark { 0xc0cce3 } else { 0x465470 }));
             self.target.DrawText(
-                &"Baca, tandai, dan tanda tangani PDF."
+                &scene
+                    .language
+                    .text((
+                        "Baca, tandai, dan tanda tangani PDF.",
+                        "Read, annotate, and sign PDFs.",
+                    ))
                     .encode_utf16()
                     .collect::<Vec<_>>(),
                 &self.body,

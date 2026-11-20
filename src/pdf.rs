@@ -1,11 +1,12 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     os::windows::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use crate::chrome::Message;
 use image::DynamicImage;
 use pdfium_render::prelude::*;
 use windows::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
@@ -53,6 +54,7 @@ enum Edit {
     Add(Mark, Option<MarkBounds>),
     Move(Vec<usize>, Point),
     ResizeHighlight(usize, (f32, f32)),
+    Erase(Vec<usize>),
 }
 
 pub struct Document {
@@ -74,7 +76,9 @@ impl Document {
             .open(&source)?;
         let pdf = engine.load_pdf_from_reader(original.try_clone()?, None)?;
         if pdf.pages().is_empty() {
-            return Err("PDF ini tidak berisi halaman.".into());
+            return Err(
+                Message(("PDF ini tidak berisi halaman.", "This PDF has no pages.")).into(),
+            );
         }
         Ok(Self {
             pdf,
@@ -112,7 +116,11 @@ impl Document {
     fn page_size(page: &PdfPage<'_>) -> Result<Point> {
         let size = (page.width().value, page.height().value);
         if !size.0.is_finite() || !size.1.is_finite() || size.0 <= 0.0 || size.1 <= 0.0 {
-            return Err("Ukuran halaman PDF tidak valid.".into());
+            return Err(Message((
+                "Ukuran halaman PDF tidak valid.",
+                "The PDF page size is invalid.",
+            ))
+            .into());
         }
         Ok(size)
     }
@@ -254,10 +262,11 @@ impl Document {
                 let width = bounds.width().value / page_size.0;
                 let height = bounds.height().value / page_size.1;
                 if width >= 1.0 || height >= 1.0 {
-                    return Err(
-                        "Teks terlalu panjang untuk halaman ini. Masukkan teks yang lebih pendek."
-                            .into(),
-                    );
+                    return Err(Message((
+                        "Teks terlalu panjang untuk halaman ini. Masukkan teks yang lebih pendek.",
+                        "The text is too long for this page. Enter shorter text.",
+                    ))
+                    .into());
                 }
                 let left = at.0.min(1.0 - width);
                 let top = at.1.min(1.0 - height);
@@ -311,10 +320,21 @@ impl Document {
                     a.1 += top;
                     b.1 += bottom;
                 }
-                Edit::Add(..) => {}
+                Edit::Add(..) | Edit::Erase(_) => {}
             }
         }
         offsets
+    }
+
+    fn erased(edits: &[(u16, Edit, u64)]) -> HashSet<usize> {
+        edits
+            .iter()
+            .flat_map(|(_, edit, _)| match edit {
+                Edit::Erase(ids) => ids.as_slice(),
+                _ => &[],
+            })
+            .copied()
+            .collect()
     }
 
     pub fn is_highlight(&self, id: usize) -> bool {
@@ -325,13 +345,23 @@ impl Document {
     }
 
     pub fn hit(&self, point: Point, tolerance: Point) -> Option<(Vec<usize>, (Point, Point))> {
+        self.hit_mark(point, tolerance, false)
+    }
+
+    fn hit_mark(
+        &self,
+        point: Point,
+        tolerance: Point,
+        precise_ink: bool,
+    ) -> Option<(Vec<usize>, MarkBounds)> {
         let offsets = Self::offsets(&self.edits);
+        let erased = Self::erased(&self.edits);
         let marks = self
             .edits
             .iter()
             .enumerate()
             .filter_map(|(id, (page, edit, _))| {
-                if *page != self.index {
+                if *page != self.index || erased.contains(&id) {
                     return None;
                 }
                 let Edit::Add(mark, bounds) = edit else {
@@ -341,11 +371,22 @@ impl Document {
                 let (a, b) = (*bounds)?;
                 Some((id, mark, translate(a, top_left), translate(b, bottom_right)))
             });
-        let (id, mark, mut a, mut b) = marks.clone().rev().find(|(_, _, a, b)| {
+        let (id, mark, mut a, mut b) = marks.clone().rev().find(|(id, mark, a, b)| {
             point.0 >= a.0 - tolerance.0
                 && point.0 <= b.0 + tolerance.0
                 && point.1 >= a.1 - tolerance.1
                 && point.1 <= b.1 + tolerance.1
+                && match mark {
+                    Mark::Ink(points, _) if precise_ink => Self::near_stroke(
+                        points,
+                        translate(
+                            point,
+                            offsets.get(id).map_or((0.0, 0.0), |(a, _)| (-a.0, -a.1)),
+                        ),
+                        tolerance,
+                    ),
+                    _ => true,
+                }
         })?;
         let mut ids = vec![id];
         if let Mark::Ink(_, Some(group)) = mark {
@@ -358,6 +399,30 @@ impl Document {
             }
         }
         Some((ids, (a, b)))
+    }
+
+    fn near_stroke(points: &[Point], point: Point, tolerance: Point) -> bool {
+        let relative = |p: Point| ((p.0 - point.0) / tolerance.0, (p.1 - point.1) / tolerance.1);
+        points.windows(2).any(|pair| {
+            let (x, y) = relative(pair[0]);
+            let (end_x, end_y) = relative(pair[1]);
+            let (dx, dy) = (end_x - x, end_y - y);
+            let length = dx * dx + dy * dy;
+            let t = if length > 0.0 {
+                (-(x * dx + y * dy) / length).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            (x + t * dx).hypot(y + t * dy) <= 1.0
+        })
+    }
+
+    pub fn erase_at(&mut self, point: Point, tolerance: Point) -> Result<bool> {
+        let Some((ids, _)) = self.hit_mark(point, tolerance, true) else {
+            return Ok(false);
+        };
+        self.update(Edit::Erase(ids))?;
+        Ok(true)
     }
 
     pub fn move_mark(&mut self, ids: Vec<usize>, delta: Point) -> Result<()> {
@@ -397,8 +462,11 @@ impl Document {
             .load_pdf_from_reader(self.original.try_clone()?, None)?;
         let edits = &self.edits[..count];
         let offsets = Self::offsets(edits);
+        let erased = Self::erased(edits);
         for (id, (index, edit, _)) in edits.iter().enumerate() {
-            if let Edit::Add(mark, _) = edit {
+            if let Edit::Add(mark, _) = edit
+                && !erased.contains(&id)
+            {
                 let (a, b) = offsets.get(&id).copied().unwrap_or_default();
                 if let Mark::Highlight(start, end) = mark {
                     Self::apply(
@@ -426,9 +494,16 @@ impl Document {
 
     pub fn save_copy(&mut self, path: &Path) -> Result<()> {
         if source_is_destination(&self.source, path) {
-            return Err("Pilih nama lain agar PDF sumber tetap tersimpan.".into());
+            return Err(Message((
+                "Pilih nama lain agar PDF sumber tetap tersimpan.",
+                "Choose another name to preserve the original PDF.",
+            ))
+            .into());
         }
-        let dir = path.parent().ok_or("Lokasi penyimpanan tidak valid.")?;
+        let dir = path.parent().ok_or(Message((
+            "Lokasi penyimpanan tidak valid.",
+            "The save location is invalid.",
+        )))?;
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let temp = dir.join(format!(".hubbypdf-{}-{stamp}.tmp", std::process::id()));
         let mut file = OpenOptions::new()
@@ -468,6 +543,7 @@ mod tests {
         let folder = Path::new(env!("CARGO_MANIFEST_DIR"));
         let engine = Box::leak(Box::new(crate::load_pdfium(
             &folder.join("vendor/pdfium/bin"),
+            crate::chrome::Language::Indonesian,
         )?));
         crate::verify_window_controls(engine)?;
         let work = folder.join("target/pdf-smoke");
@@ -508,6 +584,22 @@ mod tests {
         doc.add(Mark::Highlight((0.09, 0.18), (0.25, 0.21)))?;
         let rgba = image::RgbaImage::from_pixel(10, 4, image::Rgba([20, 40, 180, 150]));
         doc.add(Mark::Signature((0.1, 0.45), (0.3, 0.5), rgba.into()))?;
+        let tolerance = (0.003, 0.003);
+        let before = doc.render(420, 594)?.bytes;
+        assert!(!doc.erase_at((0.16, 0.29), tolerance)?);
+        for point in [
+            (0.12, 0.605),
+            (0.15, 0.25),
+            (0.25, 0.43),
+            (0.15, 0.19),
+            (0.18, 0.47),
+        ] {
+            assert!(doc.erase_at(point, tolerance)?);
+            assert!(doc.hit(point, tolerance).is_none());
+            assert_ne!(doc.render(420, 594)?.bytes, before);
+            doc.undo()?;
+            assert_eq!(doc.render(420, 594)?.bytes, before);
+        }
         for (start, delta) in [
             ((0.12, 0.605), (0.4, 0.0)),
             ((0.2, 0.28), (0.4, 0.0)),
@@ -545,6 +637,7 @@ mod tests {
         doc.move_mark(ids, (0.4, 0.0))?;
         let (ids, _) = doc.hit((0.12, 0.605), (0.001, 0.001)).unwrap();
         doc.move_mark(ids, (0.4, 0.0))?;
+        assert!(doc.erase_at((0.58, 0.47), tolerance)?);
         assert!(doc.dirty());
         assert_ne!(rendered.bytes, doc.render(420, 594)?.bytes);
         assert!(doc.save_copy(&source).is_err());
@@ -552,11 +645,12 @@ mod tests {
         assert!(!doc.dirty());
         assert_eq!(fs::read(source)?, original);
 
-        let saved = Document::open(engine, output)?;
+        let mut saved = Document::open(engine, output)?;
+        assert!(!saved.erase_at((0.52, 0.605), tolerance)?);
 
         let page = saved.pdf.pages().get(0)?;
 
-        assert_eq!(page.objects().len(), 5);
+        assert_eq!(page.objects().len(), 4);
 
         assert!(page.text()?.all().contains("Uji HubbyPDF"));
         assert!(page.objects().get(0)?.bounds()?.left().value > 280.0);
@@ -564,6 +658,8 @@ mod tests {
         doc.undo()?;
         assert!(doc.dirty());
 
+        assert_eq!(doc.pdf.pages().get(0)?.objects().len(), 5);
+        doc.undo()?;
         assert_eq!(doc.pdf.pages().get(0)?.objects().len(), 5);
         doc.undo()?;
         assert_eq!(doc.pdf.pages().get(0)?.objects().len(), 5);

@@ -12,6 +12,7 @@ use std::{
 };
 
 use canvas::{Canvas, Preview, Scene};
+use chrome::{Label, Language, Message};
 use image::{DynamicImage, ImageReader};
 use pdf::{Document, Mark, Point, Result};
 use pdfium_render::prelude::Pdfium;
@@ -45,17 +46,24 @@ const SKETCH: u16 = 123;
 const SIGN: u16 = 124;
 const PNG: u16 = 125;
 const UNDO: u16 = 126;
+const ERASE: u16 = 127;
 const ZOOM_PICKER: u16 = 130;
 const THEME: u16 = 131;
 const MENU_FILE: u16 = 140;
 const MENU_VIEW: u16 = 141;
 const MENU_TOOLS: u16 = 142;
+const MENU_LANGUAGE: u16 = 143;
+const INDONESIAN: u16 = 144;
+const ENGLISH: u16 = 145;
 const MENU_ROW: i32 = 28;
-const MENU_BUTTONS: &[(u16, &str, i32)] = &[
-    (MENU_FILE, "File", 48),
-    (MENU_VIEW, "Tampilan", 77),
-    (MENU_TOOLS, "Alat", 48),
+const MENU_BUTTONS: &[(u16, Label)] = &[
+    (MENU_FILE, ("File", "File")),
+    (MENU_VIEW, ("Tampilan", "View")),
+    (MENU_TOOLS, ("Alat", "Tools")),
+    (MENU_LANGUAGE, ("Bahasa", "Language")),
 ];
+const FIT_LABEL: Label = ("Pas jendela", "Fit window");
+const OPEN_LABEL: Label = ("Buka PDF…", "Open PDF…");
 
 #[derive(Clone, Copy, Default)]
 struct PaintColors {
@@ -122,27 +130,50 @@ impl Drag {
     }
 }
 
-const FILE_COMMANDS: &[(u16, &str)] = &[
-    (OPEN, "&Buka PDF…\tCtrl+O"),
-    (SAVE, "&Simpan salinan…\tCtrl+Shift+S"),
-    (EXIT, "&Keluar"),
+const FILE_COMMANDS: &[(u16, Label)] = &[
+    (OPEN, ("&Buka PDF…\tCtrl+O", "&Open PDF…\tCtrl+O")),
+    (
+        SAVE,
+        (
+            "&Simpan salinan…\tCtrl+Shift+S",
+            "&Save a copy…\tCtrl+Shift+S",
+        ),
+    ),
+    (EXIT, ("&Keluar", "E&xit")),
 ];
-const VIEW_COMMANDS: &[(u16, &str)] = &[
-    (PREVIOUS, "&Halaman sebelumnya\tPage Up"),
-    (NEXT, "Halaman &berikutnya\tPage Down"),
-    (ZOOM_IN, "&Perbesar\tCtrl++"),
-    (ZOOM_OUT, "Per&kecil\tCtrl+-"),
-    (FIT, "&Pas ke jendela\tCtrl+0"),
-    (THEME, "Tema &gelap"),
+const VIEW_COMMANDS: &[(u16, Label)] = &[
+    (
+        PREVIOUS,
+        ("&Halaman sebelumnya\tPage Up", "&Previous page\tPage Up"),
+    ),
+    (
+        NEXT,
+        ("Halaman &berikutnya\tPage Down", "&Next page\tPage Down"),
+    ),
+    (ZOOM_IN, ("&Perbesar\tCtrl++", "Zoom &in\tCtrl++")),
+    (ZOOM_OUT, ("Per&kecil\tCtrl+-", "Zoom &out\tCtrl+-")),
+    (FIT, ("&Pas ke jendela\tCtrl+0", "&Fit window\tCtrl+0")),
+    (THEME, ("Tema &gelap", "&Dark theme")),
 ];
-const TOOLS: &[(u16, &str)] = &[
-    (READ, "&Pilih / geser\tEsc"),
-    (TEXT, "&Tambah teks…"),
-    (HIGHLIGHT, "So&rot"),
-    (SKETCH, "&Sketsa"),
-    (SIGN, "&Gambar tanda tangan"),
-    (PNG, "I&mpor tanda tangan PNG…"),
-    (UNDO, "&Batalkan perubahan terakhir\tCtrl+Z"),
+const TOOLS: &[(u16, Label)] = &[
+    (READ, ("&Pilih / geser\tEsc", "&Select / move\tEsc")),
+    (TEXT, ("&Tambah teks…", "Add &text…")),
+    (HIGHLIGHT, ("So&rot", "&Highlight")),
+    (SKETCH, ("&Sketsa", "S&ketch")),
+    (SIGN, ("&Gambar tanda tangan", "&Draw signature")),
+    (PNG, ("I&mpor tanda tangan PNG…", "&Import PNG signature…")),
+    (ERASE, ("&Hapus objek", "&Erase object")),
+    (
+        UNDO,
+        (
+            "&Batalkan perubahan terakhir\tCtrl+Z",
+            "&Undo last edit\tCtrl+Z",
+        ),
+    ),
+];
+const LANGUAGES: &[(u16, Label)] = &[
+    (INDONESIAN, ("Bahasa &Indonesia", "Bahasa &Indonesia")),
+    (ENGLISH, ("&English", "&English")),
 ];
 
 thread_local! {
@@ -163,6 +194,7 @@ struct App {
     action_font: HFONT,
     icon_font: HFONT,
     dark: bool,
+    language: Language,
     toolbar_dividers: Vec<(i32, i32)>,
     dpi: f32,
     contrast: bool,
@@ -189,7 +221,7 @@ struct App {
 }
 
 impl App {
-    fn new(engine: &'static Pdfium) -> Self {
+    fn new(engine: &'static Pdfium, language: Language) -> Self {
         Self {
             engine,
             doc: None,
@@ -203,6 +235,7 @@ impl App {
             action_font: HFONT::default(),
             icon_font: HFONT::default(),
             dark: chrome::load_dark(),
+            language,
             toolbar_dividers: Vec::new(),
             dpi: 1.0,
             contrast: chrome::high_contrast(),
@@ -239,6 +272,30 @@ impl App {
         self.footer = px(chrome::FOOTER);
         let (w, h) = (self.width as i32, self.height as i32);
         unsafe {
+            let dc = CreateCompatibleDC(None);
+            if dc.is_invalid() {
+                return Err(windows::core::Error::from_win32().into());
+            }
+            let previous_font = SelectObject(dc, self.font);
+            let text_width = |label| {
+                chrome::text_width(
+                    dc,
+                    &mut self.language.text(label).encode_utf16().collect::<Vec<_>>(),
+                )
+            };
+            let menu_widths: Vec<_> = MENU_BUTTONS
+                .iter()
+                .map(|&(_, label)| text_width(label) + 2 * px(12))
+                .collect();
+            let tool_widths: Vec<_> = chrome::TOOLS
+                .iter()
+                .map(|&(_, label, _)| {
+                    text_width(label) + px(chrome::ICON_SIZE) + px(chrome::ICON_GAP) + 2 * px(10)
+                })
+                .collect();
+            SelectObject(dc, previous_font);
+            let _ = DeleteDC(dc);
+
             MoveWindow(
                 self.status,
                 px(22),
@@ -256,50 +313,47 @@ impl App {
                 true,
             )?;
             let mut menu_left = px(12);
-            for ((_, button), (_, _, width)) in self.menu_buttons.iter().zip(MENU_BUTTONS) {
-                MoveWindow(
-                    *button,
-                    menu_left,
-                    px(2),
-                    px(*width),
-                    px(MENU_ROW - 4),
-                    true,
-                )?;
-                menu_left += px(*width + 2);
+            for ((_, button), width) in self.menu_buttons.iter().zip(menu_widths) {
+                MoveWindow(*button, menu_left, px(2), width, px(MENU_ROW - 4), true)?;
+                menu_left += width + px(2);
             }
             let mut left = px(16);
             let mut row = 0;
             self.toolbar_dividers.clear();
-            for ((id, button), (_, _, width, _)) in self.toolbar.iter().zip(chrome::TOOLS) {
-                if *id == THEME {
+            let theme_width = *tool_widths.last().unwrap();
+            for (index, (&(id, button), &width)) in
+                self.toolbar.iter().zip(&tool_widths).enumerate()
+            {
+                if id == THEME {
                     MoveWindow(
-                        *button,
-                        (w - px(width + 16)).max(0),
+                        button,
+                        (w - width - px(16)).max(0),
                         px(MENU_ROW + 10),
-                        px(*width),
+                        width,
                         px(36),
                         true,
                     )?;
                     continue;
                 }
-                let limit = w - px(if row == 0 { 116 } else { 16 });
-                if left + px(*width) > limit && left > px(16) {
+                let mut limit = if row == 0 {
+                    w - theme_width - px(28)
+                } else {
+                    w - px(16)
+                };
+                if left + width > limit && left > px(16) {
                     left = px(16);
                     row += 1;
+                    limit = w - px(16);
                 }
                 let top = px(MENU_ROW + 10 + row * 42);
-                MoveWindow(*button, left, top, px(*width), px(36), true)?;
-                if matches!(*id, SAVE | PNG)
-                    && let Some((_, _, next_width, _)) = chrome::TOOLS
-                        .iter()
-                        .skip_while(|entry| entry.0 != *id)
-                        .nth(1)
-                    && left + px(width + 19 + next_width) <= limit
+                MoveWindow(button, left, top, width, px(36), true)?;
+                if matches!(id, SAVE | PNG)
+                    && left + width + px(19) + tool_widths[index + 1] <= limit
                 {
-                    self.toolbar_dividers.push((left + px(width + 9), top));
-                    left += px(width + 19);
+                    self.toolbar_dividers.push((left + width + px(9), top));
+                    left += width + px(19);
                 } else {
-                    left += px(width + 3);
+                    left += width + px(3);
                 }
             }
             self.header = px(MENU_ROW + chrome::HEADER + row * 42);
@@ -397,7 +451,12 @@ impl App {
             let menu = CreatePopupMenu()?;
             let result = (|| -> windows::core::Result<i32> {
                 let flag = |selected| MF_STRING | if selected { MF_CHECKED } else { MF_UNCHECKED };
-                AppendMenuW(menu, flag(self.zoom.is_none()), 1, w!("Pas jendela"))?;
+                AppendMenuW(
+                    menu,
+                    flag(self.zoom.is_none()),
+                    1,
+                    PCWSTR(wide(self.language.text(FIT_LABEL)).as_ptr()),
+                )?;
                 AppendMenuW(menu, MF_SEPARATOR, 0, None)?;
                 for (i, level) in ZOOM_LEVELS.iter().enumerate() {
                     let label = wide(&format!("{level}%"));
@@ -432,7 +491,7 @@ impl App {
         self.dpi = unsafe { GetDpiForWindow(hwnd) }.max(96) as f32 / 96.0;
         let font = chrome::font((14.0 * self.dpi).round() as i32, 400);
         let action = chrome::font((15.0 * self.dpi).round() as i32, 600);
-        let icons = chrome::icon_font((16.0 * self.dpi).round() as i32);
+        let icons = chrome::icon_font((chrome::ICON_SIZE as f32 * self.dpi).round() as i32);
         unsafe {
             for control in [self.status, self.editor, self.zoom_picker]
                 .into_iter()
@@ -614,32 +673,88 @@ impl App {
         repaint(hwnd);
     }
 
+    fn set_language(&mut self, language: Language) -> Result<()> {
+        let menu = make_menu(language)?;
+        let old = std::mem::replace(&mut self.menu, menu);
+        self.language = language;
+        unsafe {
+            if !old.is_invalid() {
+                let _ = DestroyMenu(old);
+            }
+            for ((_, button), (_, label)) in self.menu_buttons.iter().zip(MENU_BUTTONS) {
+                let _ = SetWindowTextW(*button, PCWSTR(wide(language.text(*label)).as_ptr()));
+                repaint(*button);
+            }
+            for ((_, button), (_, label, _)) in self.toolbar.iter().zip(chrome::TOOLS) {
+                let _ = SetWindowTextW(*button, PCWSTR(wide(language.text(*label)).as_ptr()));
+                repaint(*button);
+            }
+            let _ = SetWindowTextW(
+                self.open_button,
+                PCWSTR(wide(language.text(OPEN_LABEL)).as_ptr()),
+            );
+            let cue = wide(language.text(("Teks untuk ditambahkan", "Text to add")));
+            SendMessageW(
+                self.editor,
+                EM_SETCUEBANNER,
+                WPARAM(1),
+                LPARAM(cue.as_ptr() as isize),
+            );
+        }
+        Ok(())
+    }
+
     fn sync(&self, hwnd: HWND) {
+        let language = self.language;
         let (title, page, dirty) = match &self.doc {
             Some(doc) => {
                 let name = doc.source.file_name().unwrap_or_default().to_string_lossy();
                 let dirty = doc.dirty();
                 (
                     format!("{}{name} | HubbyPDF", if dirty { "* " } else { "" }),
-                    format!("Halaman {} / {}", doc.index + 1, doc.count()),
+                    format!(
+                        "{} {} / {}",
+                        language.text(("Halaman", "Page")),
+                        doc.index + 1,
+                        doc.count()
+                    ),
                     dirty,
                 )
             }
             None => ("HubbyPDF".into(), String::new(), false),
         };
-        let hint = match self.tool {
-            TEXT if self.text_at.is_some() => {
-                "Ketik teks · Enter untuk menempatkan, Esc untuk batal."
+        let hint = language.text(match self.tool {
+            TEXT if self.text_at.is_some() => (
+                "Ketik teks · Enter untuk menempatkan, Esc untuk batal.",
+                "Type text · Enter to place, Esc to cancel.",
+            ),
+            TEXT => (
+                "Klik posisi teks pada halaman.",
+                "Click where you want to add text.",
+            ),
+            READ if self.doc.is_some() && !dirty => {
+                ("Seret objek untuk menggeser.", "Drag an object to move it.")
             }
-            TEXT => "Klik posisi teks pada halaman.",
-            READ if self.doc.is_some() && !dirty => "Seret objek untuk menggeser.",
-            HIGHLIGHT => "Sorot · Seret mendatar, lalu tarik pegangan untuk mengubah tinggi.",
-            SKETCH => "Sketsa · Gambar di halaman.",
-            SIGN => "Tanda tangan · Gambar di halaman.",
-            PNG => "Tanda tangan PNG · Seret untuk menentukan ukuran, atau tekan Enter.",
-            _ if dirty => "Perubahan belum disimpan",
-            _ => "",
-        };
+            HIGHLIGHT => (
+                "Sorot · Seret mendatar, lalu tarik pegangan untuk mengubah tinggi.",
+                "Highlight · Drag horizontally, then pull a handle to adjust the height.",
+            ),
+            SKETCH => ("Sketsa · Gambar di halaman.", "Sketch · Draw on the page."),
+            SIGN => (
+                "Tanda tangan · Gambar di halaman.",
+                "Signature · Draw on the page.",
+            ),
+            PNG => (
+                "Tanda tangan PNG · Seret untuk menentukan ukuran, atau tekan Enter.",
+                "PNG signature · Drag to size it, or press Enter.",
+            ),
+            ERASE => (
+                "Klik objek tambahan untuk menghapusnya.",
+                "Click an object you added to erase it.",
+            ),
+            _ if dirty => ("Perubahan belum disimpan", "Unsaved changes"),
+            _ => ("", ""),
+        });
         let right = self.notice.as_deref().unwrap_or(hint);
         let status = if page.is_empty() || right.is_empty() {
             format!("{page}{right}")
@@ -697,7 +812,7 @@ impl App {
                 THEME as u32,
                 (MF_BYCOMMAND | if self.dark { MF_CHECKED } else { MF_UNCHECKED }).0,
             );
-            for &(id, _) in &TOOLS[..6] {
+            for &(id, _) in TOOLS.iter().filter(|(id, _)| *id != UNDO) {
                 let _ = CheckMenuItem(
                     menu,
                     id as u32,
@@ -710,6 +825,17 @@ impl App {
                     .0,
                 );
             }
+            let _ = CheckMenuRadioItem(
+                menu,
+                INDONESIAN as u32,
+                ENGLISH as u32,
+                if language == Language::English {
+                    ENGLISH
+                } else {
+                    INDONESIAN
+                } as u32,
+                MF_BYCOMMAND.0,
+            );
         }
     }
 
@@ -736,7 +862,13 @@ impl App {
             || unsafe {
                 MessageBoxW(
                     hwnd,
-                    w!("Buang perubahan yang belum disimpan?"),
+                    PCWSTR(
+                        wide(self.language.text((
+                            "Buang perubahan yang belum disimpan?",
+                            "Discard unsaved changes?",
+                        )))
+                        .as_ptr(),
+                    ),
                     w!("HubbyPDF"),
                     MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING,
                 ) == IDYES
@@ -745,19 +877,49 @@ impl App {
 
     fn command(&mut self, hwnd: HWND, id: u16) -> Result<()> {
         self.notice = None;
-        if (MENU_FILE..=MENU_TOOLS).contains(&id) {
+        if (MENU_FILE..=MENU_LANGUAGE).contains(&id) {
             return self.show_menu(hwnd, id);
+        }
+        if matches!(id, INDONESIAN | ENGLISH) {
+            let language = if id == ENGLISH {
+                Language::English
+            } else {
+                Language::Indonesian
+            };
+            if language != self.language {
+                self.set_language(language)?;
+                self.resize(hwnd)?;
+                if language.save().is_err() {
+                    self.notice = Some(
+                        language
+                            .text((
+                                "Bahasa diubah. Preferensi gagal disimpan.",
+                                "Language changed. Could not save the preference.",
+                            ))
+                            .into(),
+                    );
+                }
+                repaint(hwnd);
+            }
+            return Ok(());
         }
         if id == THEME {
             self.dark = !self.dark;
             self.apply_theme(hwnd);
             if chrome::save_theme(self.dark).is_err() {
-                self.notice = Some("Tema diubah. Preferensi gagal disimpan.".into());
+                self.notice = Some(
+                    self.language
+                        .text((
+                            "Tema diubah. Preferensi gagal disimpan.",
+                            "Theme changed. Could not save the preference.",
+                        ))
+                        .into(),
+                );
             }
             return Ok(());
         }
         if id == OPEN {
-            if let Some(path) = choose_file(hwnd, FileKind::Pdf, None)?
+            if let Some(path) = choose_file(hwnd, FileKind::Pdf, None, self.language)?
                 && self.discard_allowed(hwnd)
             {
                 self.open(hwnd, path)?;
@@ -777,7 +939,7 @@ impl App {
         self.drag = None;
         if matches!(
             id,
-            PREVIOUS | NEXT | UNDO | READ | TEXT | HIGHLIGHT | SKETCH | SIGN
+            PREVIOUS | NEXT | UNDO | READ | TEXT | HIGHLIGHT | SKETCH | SIGN | ERASE
         ) {
             self.selected_highlight = None;
             self.text_at = None;
@@ -788,12 +950,17 @@ impl App {
         match id {
             SAVE => {
                 let name = format!(
-                    "{} - salinan.pdf",
-                    doc.source.file_stem().unwrap_or_default().to_string_lossy()
+                    "{} - {}.pdf",
+                    doc.source.file_stem().unwrap_or_default().to_string_lossy(),
+                    self.language.text(("salinan", "copy"))
                 );
-                if let Some(path) = choose_file(hwnd, FileKind::Save, Some(&name))? {
+                if let Some(path) = choose_file(hwnd, FileKind::Save, Some(&name), self.language)? {
                     doc.save_copy(&path)?;
-                    self.notice = Some("Salinan PDF disimpan.".into());
+                    self.notice = Some(
+                        self.language
+                            .text(("Salinan PDF disimpan.", "PDF copy saved."))
+                            .into(),
+                    );
                 }
             }
             PREVIOUS | NEXT => {
@@ -834,7 +1001,7 @@ impl App {
                 self.refresh(hwnd)?;
             }
             PNG => {
-                if let Some(path) = choose_file(hwnd, FileKind::Png, None)? {
+                if let Some(path) = choose_file(hwnd, FileKind::Png, None, self.language)? {
                     let mut reader = ImageReader::with_format(
                         std::io::BufReader::new(std::fs::File::open(path)?),
                         image::ImageFormat::Png,
@@ -858,7 +1025,7 @@ impl App {
                     }
                 }
             }
-            READ | TEXT | HIGHLIGHT | SKETCH | SIGN => {
+            READ | TEXT | HIGHLIGHT | SKETCH | SIGN | ERASE => {
                 if id == SIGN && self.tool != SIGN {
                     self.signature_group += 1;
                 }
@@ -911,6 +1078,14 @@ impl App {
         } else {
             HighlightEdge::Bottom
         })
+    }
+
+    fn hit_tolerance(&self) -> Point {
+        let r = self.page_rect;
+        (
+            7.0 * self.dpi / (r.right - r.left),
+            7.0 * self.dpi / (r.bottom - r.top),
+        )
     }
 
     fn highlight_bounds(&self, start: Point, end: Point) -> (Point, Point) {
@@ -981,7 +1156,11 @@ impl App {
             return Ok(());
         }
         if !text.chars().all(|c| matches!(c, ' '..='~' | ' '..='ÿ')) {
-            return Err("Gunakan karakter Latin dasar untuk teks PDF.".into());
+            return Err(Message((
+                "Gunakan karakter Latin dasar untuk teks PDF.",
+                "Use basic Latin characters for PDF text.",
+            ))
+            .into());
         }
         self.add(hwnd, Mark::Text(point, text))?;
         unsafe { SetWindowTextW(self.editor, w!(""))? };
@@ -1055,21 +1234,36 @@ enum FileKind {
     Png,
 }
 
-fn choose_file(hwnd: HWND, kind: FileKind, name: Option<&str>) -> Result<Option<PathBuf>> {
+fn choose_file(
+    hwnd: HWND,
+    kind: FileKind,
+    name: Option<&str>,
+    language: Language,
+) -> Result<Option<PathBuf>> {
     let mut buffer = vec![0_u16; 32768];
     if let Some(name) = name {
         let name = wide(name);
         buffer[..name.len()].copy_from_slice(&name);
     }
-    let (filter, extension) = match kind {
-        FileKind::Pdf | FileKind::Save => (w!("Dokumen PDF (*.pdf)\0*.pdf\0"), w!("pdf")),
-        FileKind::Png => (w!("Gambar PNG (*.png)\0*.png\0"), w!("png")),
+    let (label, extension) = match kind {
+        FileKind::Pdf | FileKind::Save => (
+            (
+                "Dokumen PDF (*.pdf)\0*.pdf\0",
+                "PDF documents (*.pdf)\0*.pdf\0",
+            ),
+            w!("pdf"),
+        ),
+        FileKind::Png => (
+            ("Gambar PNG (*.png)\0*.png\0", "PNG images (*.png)\0*.png\0"),
+            w!("png"),
+        ),
     };
+    let filter = wide(language.text(label));
     let save = matches!(kind, FileKind::Save);
     let mut dialog = OPENFILENAMEW {
         lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
         hwndOwner: hwnd,
-        lpstrFilter: filter,
+        lpstrFilter: PCWSTR(filter.as_ptr()),
         nFilterIndex: 1,
         lpstrFile: PWSTR(buffer.as_mut_ptr()),
         nMaxFile: buffer.len() as u32,
@@ -1095,7 +1289,8 @@ fn choose_file(hwnd: HWND, kind: FileKind, name: Option<&str>) -> Result<Option<
             return if error.0 == 0 {
                 Ok(None)
             } else {
-                Err(format!("Dialog file gagal (0x{:X}).", error.0).into())
+                let message = language.text(("Dialog file gagal", "File dialog failed"));
+                Err(format!("{message} (0x{:X}).", error.0).into())
             };
         }
     }
@@ -1106,8 +1301,15 @@ fn choose_file(hwnd: HWND, kind: FileKind, name: Option<&str>) -> Result<Option<
     Ok(Some(PathBuf::from(OsString::from_wide(&buffer[..end]))))
 }
 
-fn show_error(hwnd: HWND, error: &dyn std::fmt::Display) {
-    let message = wide(&error.to_string());
+fn error_text(language: Language, error: &(dyn std::error::Error + 'static)) -> String {
+    match error.downcast_ref::<Message>() {
+        Some(message) => language.text(message.0).into(),
+        None => error.to_string(),
+    }
+}
+
+fn show_error(hwnd: HWND, language: Language, error: &(dyn std::error::Error + 'static)) {
+    let message = wide(&error_text(language, error));
     unsafe {
         MessageBoxW(
             hwnd,
@@ -1182,6 +1384,7 @@ fn process_message(
                         page: app.page_rect,
                         viewport: app.viewport(),
                         dpi: app.dpi,
+                        language: app.language,
                         system_background,
                         dark: app.dark,
                         toolbar_dividers: &app.toolbar_dividers,
@@ -1191,7 +1394,7 @@ fn process_message(
                 {
                     app.canvas = None;
                     if let Err(error) = app.refresh(hwnd) {
-                        app.notice = Some(error.to_string());
+                        app.notice = Some(error_text(app.language, error.as_ref()));
                         app.sync(hwnd);
                     }
                 }
@@ -1203,7 +1406,15 @@ fn process_message(
         }
         WM_LBUTTONDOWN => {
             if let Some(point) = app.point(lparam, false) {
-                if let Some(edge) = app.highlight_handle(point)
+                if app.tool == ERASE {
+                    let tolerance = app.hit_tolerance();
+                    if let Some(doc) = app.doc.as_mut()
+                        && doc.erase_at(point, tolerance)?
+                    {
+                        app.notice = None;
+                        app.refresh(hwnd)?;
+                    }
+                } else if let Some(edge) = app.highlight_handle(point)
                     && let Some((id, bounds)) = app.selected_highlight
                 {
                     app.drag = Some(Drag {
@@ -1218,11 +1429,7 @@ fn process_message(
                     app.begin_text(hwnd, point);
                 } else if app.tool == READ {
                     app.selected_highlight = None;
-                    let r = app.page_rect;
-                    let tolerance = (
-                        7.0 * app.dpi / (r.right - r.left),
-                        7.0 * app.dpi / (r.bottom - r.top),
-                    );
+                    let tolerance = app.hit_tolerance();
                     if let Some((ids, bounds)) =
                         app.doc.as_ref().and_then(|doc| doc.hit(point, tolerance))
                     {
@@ -1357,14 +1564,15 @@ extern "system" fn window_proc(
 ) -> LRESULT {
     if message == WM_SYNC_ZOOM_LABEL {
         let current = APP.with(|state| {
-            state
-                .try_borrow()
-                .ok()
-                .and_then(|state| state.as_ref().map(|app| (app.zoom_picker, app.zoom)))
+            state.try_borrow().ok().and_then(|state| {
+                state
+                    .as_ref()
+                    .map(|app| (app.zoom_picker, app.zoom, app.language))
+            })
         });
-        if let Some((button, zoom)) = current {
+        if let Some((button, zoom, language)) = current {
             let label = zoom.map_or_else(
-                || "Pas jendela  ▾".to_string(),
+                || format!("{}  ▾", language.text(FIT_LABEL)),
                 |level| format!("{level}%  ▾"),
             );
             unsafe {
@@ -1434,11 +1642,11 @@ extern "system" fn window_proc(
         match process_message(app, hwnd, message, wparam, lparam) {
             Ok(handled) => handled,
             Err(error) => {
-                app.notice = Some(error.to_string());
+                app.notice = Some(error_text(app.language, error.as_ref()));
                 app.sync(hwnd);
                 repaint(hwnd);
                 if message != WM_SIZE {
-                    show_error(hwnd, &error);
+                    show_error(hwnd, app.language, error.as_ref());
                 }
                 true
             }
@@ -1470,12 +1678,14 @@ fn keyboard(hwnd: HWND, message: &MSG) -> bool {
         if message.message == WM_SYSKEYDOWN {
             let id = match key.0 {
                 0x46 => MENU_FILE,
-                0x54 => MENU_VIEW,
+                0x54 if app.language == Language::English => MENU_TOOLS,
+                0x54 | 0x56 => MENU_VIEW,
                 0x41 => MENU_TOOLS,
+                0x42 | 0x4C => MENU_LANGUAGE,
                 _ => return false,
             };
             if let Err(error) = app.show_menu(hwnd, id) {
-                show_error(hwnd, &error);
+                show_error(hwnd, app.language, error.as_ref());
             }
             if unsafe { IsWindow(hwnd) }.as_bool() {
                 app.sync(hwnd);
@@ -1514,7 +1724,7 @@ fn keyboard(hwnd: HWND, message: &MSG) -> bool {
         }
         if message.hwnd == app.zoom_picker && key == VK_RETURN && !ctrl {
             if let Err(error) = app.show_zoom_menu(hwnd) {
-                show_error(hwnd, &error);
+                show_error(hwnd, app.language, error.as_ref());
             }
             app.sync(hwnd);
             return true;
@@ -1554,7 +1764,7 @@ fn keyboard(hwnd: HWND, message: &MSG) -> bool {
                     app.place_signature(hwnd, at, (at.0 + 0.25, at.1 + 0.25))
                 };
                 if let Err(error) = action {
-                    show_error(hwnd, &error);
+                    show_error(hwnd, app.language, error.as_ref());
                 }
                 app.sync(hwnd);
                 return true;
@@ -1573,7 +1783,7 @@ fn keyboard(hwnd: HWND, message: &MSG) -> bool {
             _ => return false,
         };
         if let Err(error) = app.command(hwnd, command) {
-            show_error(hwnd, &error);
+            show_error(hwnd, app.language, error.as_ref());
         }
         if unsafe { IsWindow(hwnd) }.as_bool() {
             app.sync(hwnd);
@@ -1582,35 +1792,55 @@ fn keyboard(hwnd: HWND, message: &MSG) -> bool {
     })
 }
 
-fn load_pdfium(folder: &Path) -> Result<Pdfium> {
+fn load_pdfium(folder: &Path, language: Language) -> Result<Pdfium> {
     let dll = folder.join("pdfium.dll");
     Ok(Pdfium::new(Pdfium::bind_to_library(&dll).map_err(
-        |error| format!("PDFium gagal dimuat dari {}. {error}", dll.display()),
+        |error| {
+            format!(
+                "{} {}. {error}",
+                language.text(("PDFium gagal dimuat dari", "Could not load PDFium from")),
+                dll.display()
+            )
+        },
     )?))
 }
 
-fn make_menu() -> Result<HMENU> {
+fn make_menu(language: Language) -> Result<HMENU> {
     unsafe {
         let menu = CreateMenu()?;
-        for (label, commands) in [
-            (w!("&File"), FILE_COMMANDS),
-            (w!("&Tampilan"), VIEW_COMMANDS),
-            (w!("&Alat"), TOOLS),
-        ] {
+        for ((_, label), commands) in
+            MENU_BUTTONS
+                .iter()
+                .zip([FILE_COMMANDS, VIEW_COMMANDS, TOOLS, LANGUAGES])
+        {
             let child = CreatePopupMenu()?;
             for &(id, name) in commands {
-                AppendMenuW(child, MF_STRING, id as usize, PCWSTR(wide(name).as_ptr()))?;
+                AppendMenuW(
+                    child,
+                    MF_STRING,
+                    id as usize,
+                    PCWSTR(wide(language.text(name)).as_ptr()),
+                )?;
             }
-            AppendMenuW(menu, MF_POPUP, child.0 as usize, label)?;
+            AppendMenuW(
+                menu,
+                MF_POPUP,
+                child.0 as usize,
+                PCWSTR(wide(language.text(*label)).as_ptr()),
+            )?;
         }
         Ok(menu)
     }
 }
 
-fn run() -> Result<()> {
+fn run(language: Language) -> Result<()> {
     let exe = std::env::current_exe()?;
     let engine = Box::leak(Box::new(load_pdfium(
-        exe.parent().ok_or("Lokasi aplikasi tidak tersedia.")?,
+        exe.parent().ok_or(Message((
+            "Lokasi aplikasi tidak tersedia.",
+            "The application location is unavailable.",
+        )))?,
+        language,
     )?));
     let instance = unsafe { GetModuleHandleW(None)? };
     unsafe {
@@ -1640,13 +1870,12 @@ fn run() -> Result<()> {
             instance,
             None,
         )?;
-        let mut app = App::new(engine);
-        app.menu = make_menu()?;
-        for &(id, label, _) in MENU_BUTTONS {
+        let mut app = App::new(engine, language);
+        for &(id, _) in MENU_BUTTONS {
             let button = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 w!("BUTTON"),
-                PCWSTR(wide(label).as_ptr()),
+                w!(""),
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_OWNERDRAW as u32),
                 0,
                 0,
@@ -1676,7 +1905,7 @@ fn run() -> Result<()> {
         app.open_button = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             w!("BUTTON"),
-            w!("Buka PDF…"),
+            w!(""),
             WS_CHILD | WS_TABSTOP | WINDOW_STYLE(BS_OWNERDRAW as u32),
             0,
             0,
@@ -1704,7 +1933,7 @@ fn run() -> Result<()> {
         app.zoom_picker = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             w!("BUTTON"),
-            w!("Pas jendela"),
+            w!(""),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_OWNERDRAW as u32),
             0,
             0,
@@ -1715,11 +1944,11 @@ fn run() -> Result<()> {
             instance,
             None,
         )?;
-        for &(id, name, _, _) in chrome::TOOLS {
+        for &(id, _, _) in chrome::TOOLS {
             let button = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 w!("BUTTON"),
-                PCWSTR(wide(name).as_ptr()),
+                w!(""),
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_OWNERDRAW as u32),
                 0,
                 0,
@@ -1734,16 +1963,11 @@ fn run() -> Result<()> {
         }
         app.update_fonts(hwnd);
         SendMessageW(app.editor, EM_SETLIMITTEXT, WPARAM(512), LPARAM(0));
-        SendMessageW(
-            app.editor,
-            EM_SETCUEBANNER,
-            WPARAM(1),
-            LPARAM(w!("Teks untuk ditambahkan").as_ptr() as isize),
-        );
+        app.set_language(language)?;
         app.resize(hwnd)?;
         if let Some(path) = std::env::args_os().nth(1) {
             if let Err(error) = app.open(hwnd, PathBuf::from(path)) {
-                app.notice = Some(error.to_string());
+                app.notice = Some(error_text(language, error.as_ref()));
             }
         }
         app.sync(hwnd);
@@ -1784,8 +2008,9 @@ fn run() -> Result<()> {
 }
 
 fn main() {
-    if let Err(error) = run() {
-        show_error(HWND::default(), &error);
+    let language = Language::load();
+    if let Err(error) = run(language) {
+        show_error(HWND::default(), language, error.as_ref());
     }
 }
 
@@ -1800,8 +2025,8 @@ fn verify_window_controls(engine: &'static Pdfium) -> Result<()> {
             WS_OVERLAPPED,
             0,
             0,
-            200,
-            100,
+            1100,
+            30,
             None,
             None,
             instance,
@@ -1821,24 +2046,89 @@ fn verify_window_controls(engine: &'static Pdfium) -> Result<()> {
             instance,
             None,
         )?;
-        let mut app = App::new(engine);
+        let mut app = App::new(engine, Language::Indonesian);
         app.zoom_picker = button;
         app.status = button;
         app.editor = button;
         app.open_button = button;
-        app.menu = make_menu()?;
+        for &(id, _, _) in chrome::TOOLS {
+            let tool = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("BUTTON"),
+                w!(""),
+                WS_CHILD | WINDOW_STYLE(BS_OWNERDRAW as u32),
+                0,
+                0,
+                0,
+                0,
+                parent,
+                HMENU(id as usize as *mut _),
+                instance,
+                None,
+            )?;
+            app.toolbar.push((id, tool));
+        }
+        app.update_fonts(parent);
+        app.set_language(Language::Indonesian)?;
+        app.resize(parent)?;
         APP.with(|state| *state.borrow_mut() = Some(app));
-        for (zoom, expected) in [
-            (None, "Pas jendela  ▾"),
-            (Some(120), "120%  ▾"),
-            (Some(75), "75%  ▾"),
-            (None, "Pas jendela  ▾"),
+        let mut indonesian_sign_width = 0;
+        for (language, zoom, expected) in [
+            (Language::Indonesian, None, "Pas jendela  ▾"),
+            (Language::Indonesian, Some(120), "120%  ▾"),
+            (Language::English, Some(75), "75%  ▾"),
+            (Language::English, None, "Fit window  ▾"),
+            (Language::Indonesian, None, "Pas jendela  ▾"),
         ] {
             APP.with(|state| {
                 let mut state = state.borrow_mut();
                 let app = state.as_mut().unwrap();
+                if app.language != language {
+                    app.set_language(language).unwrap();
+                    app.resize(parent).unwrap();
+                }
+                let tool_rect = |id| {
+                    let (_, tool) = app
+                        .toolbar
+                        .iter()
+                        .find(|(tool_id, _)| *tool_id == id)
+                        .unwrap();
+                    let mut rect = RECT::default();
+                    GetWindowRect(*tool, &mut rect).unwrap();
+                    rect
+                };
+                let sign = tool_rect(SIGN);
+                let sketch = tool_rect(SKETCH);
+                let png = tool_rect(PNG);
+                let gap = (3.0 * app.dpi).round() as i32;
+                assert_eq!(sign.top, png.top);
+                assert_eq!(sign.left - sketch.right, gap);
+                assert_eq!(png.left - sign.right, gap);
+                if language == Language::Indonesian {
+                    indonesian_sign_width = sign.right - sign.left;
+                } else {
+                    assert!(sign.right - sign.left < indonesian_sign_width);
+                }
                 app.zoom_to(parent, zoom).unwrap();
                 app.sync(parent);
+                let tools = GetSubMenu(app.menu, 2);
+                let mut label = [0; 64];
+                let len =
+                    GetMenuStringW(tools, ERASE as u32, Some(&mut label), MF_BYCOMMAND) as usize;
+                assert_eq!(
+                    String::from_utf16_lossy(&label[..len]),
+                    language.text(("&Hapus objek", "&Erase object"))
+                );
+                let languages = GetSubMenu(app.menu, 3);
+                let selected = if language == Language::English {
+                    ENGLISH
+                } else {
+                    INDONESIAN
+                };
+                assert_ne!(
+                    GetMenuState(languages, selected as u32, MF_BYCOMMAND) & MF_CHECKED.0,
+                    0
+                );
             });
             let mut event = MSG::default();
             assert!(
@@ -1899,6 +2189,9 @@ fn verify_window_controls(engine: &'static Pdfium) -> Result<()> {
                 TOOLS.len() as i32
             );
             DestroyMenu(app.menu).unwrap();
+            let _ = DeleteObject(app.font);
+            let _ = DeleteObject(app.action_font);
+            let _ = DeleteObject(app.icon_font);
         });
         let _ = DeleteDC(dc);
         PAINT_COLORS.with(|colors| colors.take().delete());
