@@ -16,6 +16,7 @@ Jalankan `target/HubbyPDF/HubbyPDF.exe`. Jika dipindahkan ke komputer lain, sali
 - Buka **Bentuk**, pilih persegi panjang, elips, garis, atau panah, lalu seret di halaman. Untuk panah, titik lepas mouse menentukan letak ujung panah.
 - **Sorot**, **Sketsa**, dan **Tanda tangan** menggunakan gerakan seret. Dengan **Impor PNG**, seret secara diagonal untuk mengatur posisi dan ukuran. Gambar yang sisi terpanjangnya melebihi 1.024 piksel diperkecil saat impor.
 - Klik **Pilih**, lalu seret teks tambahan, sorotan, sketsa, atau tanda tangan yang dibuat dalam sesi ini. Goresan yang dibuat dalam satu penggunaan mode Tanda tangan ikut digeser bersama. Untuk memindahkan objek lagi, tetap gunakan dokumen yang sedang terbuka. Salinan PDF menyimpan posisi akhir sebagai konten halaman.
+- Dalam mode **Pilih**, klik kolom teks, dropdown, atau checkbox pada formulir AcroForm. Tekan **Enter** untuk menerapkan teks atau **Esc** untuk membatalkannya. **Ctrl+Shift+S** menyimpan salinan dengan kolom yang tetap bisa diisi. Kalkulasi dan format otomatis yang bergantung pada JavaScript PDF belum didukung.
 - Klik **Hapus**, lalu klik teks tambahan, sorotan, goresan sketsa, atau tanda tangan yang dibuat pada dokumen yang sedang terbuka. Klik salah satu goresan tanda tangan untuk menghapus seluruh tanda tangan. **Ctrl+Z** mengembalikan objek yang terakhir dihapus.
 - **Ctrl+Z** membatalkan edit terakhir. **Esc** kembali ke mode Pilih. **Ctrl+Shift+S** menyimpan hasil sebagai file PDF terpisah.
 

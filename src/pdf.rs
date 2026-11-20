@@ -1,12 +1,13 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
+    io::{Read, Seek, SeekFrom},
     os::windows::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::chrome::Message;
+use crate::{chrome::Message, forms};
 use image::DynamicImage;
 use pdfium_render::prelude::*;
 use windows::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
@@ -55,6 +56,7 @@ enum Edit {
     Move(Vec<usize>, Point),
     ResizeHighlight(usize, (f32, f32)),
     Erase(Vec<usize>),
+    Form(usize, forms::Value),
 }
 
 pub struct Document {
@@ -189,6 +191,25 @@ impl Document {
         }
         let half = 6.0 / size.1;
         Ok(((at.1 - half).max(0.0), (at.1 + half).min(1.0)))
+    }
+
+    pub fn form_at(&self, point: Point) -> Result<Option<forms::Field>> {
+        if !self.has_form() {
+            return Ok(None);
+        }
+        let page = self.pdf.pages().get(self.index)?;
+        let (width, height, config) = Self::edit_coordinates(Self::page_size(&page)?);
+        forms::hit(&page, point, width, height, &config)
+    }
+
+    pub fn has_form(&self) -> bool {
+        self.pdf
+            .form()
+            .is_some_and(|form| matches!(form.form_type(), PdfFormType::Acrobat))
+    }
+
+    pub fn fill(&mut self, index: usize, value: forms::Value) -> Result<()> {
+        self.update(Edit::Form(index, value))
     }
 
     fn edit_coordinates((w, h): Point) -> (i32, i32, PdfRenderConfig) {
@@ -331,7 +352,7 @@ impl Document {
                     a.1 += top;
                     b.1 += bottom;
                 }
-                Edit::Add(..) | Edit::Erase(_) => {}
+                Edit::Add(..) | Edit::Erase(_) | Edit::Form(..) => {}
             }
         }
         offsets
@@ -468,10 +489,24 @@ impl Document {
 
     fn rebuild(&self, count: usize) -> Result<PdfDocument<'static>> {
         // PDFium 7543 can trap when removing a regenerated image object.
-        let mut rebuilt = self
-            .engine
-            .load_pdf_from_reader(self.original.try_clone()?, None)?;
         let edits = &self.edits[..count];
+        let mut form_changes = edits
+            .iter()
+            .filter_map(|(page, edit, _)| match edit {
+                Edit::Form(index, value) => Some((*page, *index, value)),
+                _ => None,
+            })
+            .peekable();
+        let mut original = self.original.try_clone()?;
+        let mut rebuilt = if form_changes.peek().is_some() {
+            let mut bytes = Vec::new();
+            original.seek(SeekFrom::Start(0))?;
+            original.read_to_end(&mut bytes)?;
+            let filled = forms::apply(self.engine.bindings(), &bytes, form_changes)?;
+            self.engine.load_pdf_from_byte_vec(filled, None)?
+        } else {
+            self.engine.load_pdf_from_reader(original, None)?
+        };
         let offsets = Self::offsets(edits);
         let erased = Self::erased(edits);
         for (id, (index, edit, _)) in edits.iter().enumerate() {
@@ -549,6 +584,148 @@ fn source_is_destination(source: &Path, destination: &Path) -> bool {
 mod tests {
     use super::*;
 
+    fn form_roundtrip(engine: &'static Pdfium, source: &Path, output: &Path) -> Result<()> {
+        let mut doc = Document::open(engine, source.to_owned())?;
+        assert!(doc.has_form());
+        let (text, choice, checkbox, read_only) = {
+            let page = doc.pdf.pages().get(0)?;
+            let config = Document::edit_coordinates(Document::page_size(&page)?);
+            let widgets = page.annotations();
+            let mut text = None;
+            let mut choice = None;
+            let mut checkbox = None;
+            let mut read_only = None;
+            for (i, annot) in widgets.iter().enumerate() {
+                let Some(field) = annot.as_form_field() else {
+                    continue;
+                };
+                let rect = annot.bounds()?;
+                let (x, y) = page.points_to_pixels(
+                    PdfPoints::new((rect.left().value + rect.right().value) / 2.0),
+                    PdfPoints::new((rect.top().value + rect.bottom().value) / 2.0),
+                    &config.2,
+                )?;
+                let at = (x as f32 / config.0 as f32, y as f32 / config.1 as f32);
+                if !doc.form_at(at)?.is_some_and(|found| found.index == i) {
+                    continue;
+                }
+                if field.is_read_only() {
+                    read_only.get_or_insert(at);
+                } else {
+                    match field {
+                        PdfFormField::Text(field)
+                            if !field.is_file_select() && !field.is_password() =>
+                        {
+                            if text.is_none() {
+                                text = Some((i, at, field.value()));
+                            }
+                        }
+                        PdfFormField::ComboBox(field) => {
+                            if let Some(option) =
+                                field.options().iter().find(|option| !option.is_set())
+                                && choice.is_none()
+                            {
+                                choice = Some((i, option.index() as i32));
+                            }
+                        }
+                        PdfFormField::Checkbox(field) if checkbox.is_none() => {
+                            checkbox = Some((i, field.group_value()));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            (
+                text.unwrap(),
+                choice.unwrap(),
+                checkbox.unwrap(),
+                read_only.unwrap(),
+            )
+        };
+        assert!(matches!(
+            doc.form_at(read_only)?.unwrap().control,
+            forms::Control::ReadOnly
+        ));
+        let before = doc.render(420, 594)?.bytes;
+        let replacement = "Uji baru";
+        doc.fill(text.0, forms::Value::Text(replacement.into()))?;
+        assert_ne!(doc.render(420, 594)?.bytes, before);
+        doc.undo()?;
+        let forms::Control::Text { value, .. } = doc.form_at(text.1)?.unwrap().control else {
+            panic!("text field");
+        };
+        assert_eq!(value, text.2.unwrap_or_default());
+        doc.fill(text.0, forms::Value::Text(replacement.into()))?;
+        doc.fill(choice.0, forms::Value::Choice(choice.1))?;
+        doc.fill(checkbox.0, forms::Value::Toggle)?;
+        doc.add(Mark::Ink(
+            vec![(0.01, 0.01), (0.02, 0.02)],
+            None,
+            PdfColor::BLUE,
+        ))?;
+        doc.save_copy(output)?;
+        let saved = Document::open(engine, output.to_owned())?;
+        let page = saved.pdf.pages().get(0)?;
+        let widgets = page.annotations();
+        let a = widgets.get(text.0)?;
+        let b = widgets.get(choice.0)?;
+        let c = widgets.get(checkbox.0)?;
+        assert_eq!(
+            a.as_form_field()
+                .unwrap()
+                .as_text_field()
+                .unwrap()
+                .value()
+                .as_deref(),
+            Some(replacement)
+        );
+        let choice_field = b.as_form_field().unwrap().as_combo_box_field().unwrap();
+        assert_eq!(
+            choice_field
+                .options()
+                .iter()
+                .find(|option| option.is_set())
+                .unwrap()
+                .index() as i32,
+            choice.1
+        );
+        assert_ne!(
+            c.as_form_field()
+                .unwrap()
+                .as_checkbox_field()
+                .unwrap()
+                .group_value(),
+            checkbox.1
+        );
+        assert_eq!(doc.render(420, 594)?.bytes, saved.render(420, 594)?.bytes);
+        Ok(())
+    }
+
+    fn form_fixture() -> Vec<u8> {
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [4 0 R 5 0 R 6 0 R 7 0 R] /DA (/Helv 12 Tf 0 g) /DR << /Font << /Helv 8 0 R >> >> >> >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 500] /Resources << >> /Annots [4 0 R 5 0 R 6 0 R 7 0 R] >>",
+            "<< /Type /Annot /Subtype /Widget /Rect [50 420 280 449] /P 3 0 R /FT /Tx /T (Text) /V (Old) /F 4 >>",
+            "<< /Type /Annot /Subtype /Widget /Rect [50 360 280 389] /P 3 0 R /FT /Ch /Ff 131072 /T (Choice) /Opt [[(one) (First)] [(two) (Second)]] /V (one) /F 4 >>",
+            "<< /Type /Annot /Subtype /Widget /Rect [50 300 76 326] /P 3 0 R /FT /Btn /T (Check) /V /Off /AS /Off /AP << /N << /Off 9 0 R /Checked 10 0 R >> >> /F 4 >>",
+            "<< /Type /Annot /Subtype /Widget /Rect [50 240 280 269] /P 3 0 R /FT /Tx /Ff 1 /T (ReadOnly) /V (Locked) /F 4 >>",
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            "<< /Type /XObject /Subtype /Form /BBox [0 0 26 26] /Length 0 >>\nstream\n\nendstream",
+            "<< /Type /XObject /Subtype /Form /BBox [0 0 26 26] /Length 12 >>\nstream\n0 0 26 26 re\nendstream",
+        ];
+        let mut pdf = String::from("%PDF-1.7\n");
+        let mut xref = String::from("0000000000 65535 f \n");
+        use std::fmt::Write as _;
+        for (index, object) in objects.iter().enumerate() {
+            writeln!(xref, "{:010} 00000 n ", pdf.len()).unwrap();
+            writeln!(pdf, "{} 0 obj\n{object}\nendobj", index + 1).unwrap();
+        }
+        let start = pdf.len();
+        writeln!(pdf, "xref\n0 {size}\n{xref}trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{start}\n%%EOF", size = objects.len() + 1).unwrap();
+        pdf.into_bytes()
+    }
+
     #[test]
     fn edit_render_undo_and_save_copy() -> Result<()> {
         let folder = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -558,6 +735,16 @@ mod tests {
         )?));
         let work = folder.join("target/pdf-smoke");
         fs::create_dir_all(&work)?;
+        let form = work.join("acroform.pdf");
+        fs::write(&form, form_fixture())?;
+        form_roundtrip(engine, &form, &work.join("acroform-filled.pdf"))?;
+        if let Some(sample) = std::env::var_os("HUBBYPDF_TEST_FORM") {
+            form_roundtrip(
+                engine,
+                Path::new(&sample),
+                &work.join("form-sample-filled.pdf"),
+            )?;
+        }
         let source = work.join("sumber.pdf");
         let output = work.join("salinan.pdf");
         {

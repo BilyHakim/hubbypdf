@@ -155,6 +155,7 @@ pub fn draw_button(
 ) {
     let base_color = colorref(if dark { DARK_SURFACE } else { LIGHT_SURFACE });
     let id = item.CtlID as u16;
+    let page_arrow = matches!(id, super::PREVIOUS | super::NEXT);
     let disabled = item.itemState.0 & ODS_DISABLED.0 != 0;
     let pressed = item.itemState.0 & ODS_SELECTED.0 != 0;
     let focused = item.itemState.0 & ODS_FOCUS.0 != 0;
@@ -188,7 +189,7 @@ pub fn draw_button(
                 )
             } else if active || pressed {
                 (colorref(0x35456c), colorref(0x657cba), colorref(0xf1f5ff))
-            } else if matches!(id, super::ZOOM_PICKER | super::THEME) {
+            } else if page_arrow || matches!(id, super::ZOOM_PICKER | super::THEME) {
                 (colorref(0x2a3345), colorref(0x54647e), colorref(DARK_TEXT))
             } else {
                 (base_color, base_color, colorref(DARK_TEXT))
@@ -209,7 +210,7 @@ pub fn draw_button(
             )
         } else if active || pressed {
             (rgb(224, 231, 251), rgb(131, 150, 200), rgb(34, 55, 110))
-        } else if matches!(id, super::ZOOM_PICKER | super::THEME) {
+        } else if page_arrow || matches!(id, super::ZOOM_PICKER | super::THEME) {
             (rgb(255, 255, 255), rgb(130, 143, 166), rgb(42, 53, 76))
         } else {
             (rgb(248, 249, 252), rgb(248, 249, 252), rgb(42, 53, 76))
@@ -240,7 +241,17 @@ pub fn draw_button(
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, text);
         let mut label = [0; 64];
-        let len = GetWindowTextW(item.hwndItem, &mut label) as usize;
+        let len = if page_arrow {
+            SelectObject(dc, icon_font);
+            label[0] = if id == super::PREVIOUS {
+                0xe76b
+            } else {
+                0xe76c
+            };
+            1
+        } else {
+            GetWindowTextW(item.hwndItem, &mut label) as usize
+        };
         let mut label_rect = r;
         if !primary && let Some(&(_, _, glyph)) = TOOLS.iter().find(|tool| tool.0 == id) {
             let icon_size = (ICON_SIZE as f32 * dpi).round() as i32;

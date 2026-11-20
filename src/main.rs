@@ -3,6 +3,7 @@
 mod canvas;
 mod chrome;
 mod drawing;
+mod forms;
 mod page_picker;
 mod pdf;
 
@@ -63,6 +64,8 @@ const INDONESIAN: u16 = 144;
 const ENGLISH: u16 = 145;
 const PAGE_PICKER: u16 = 146;
 const MENU_ROW: i32 = 28;
+const PAGE_ARROW_SIZE: i32 = 36;
+const PAGE_ARROW_INSET: i32 = 10;
 const MENU_BUTTONS: &[(u16, Label)] = &[
     (MENU_FILE, ("File", "File")),
     (MENU_VIEW, ("Tampilan", "View")),
@@ -100,6 +103,14 @@ struct Drag {
     bounds: (Point, Point),
     delta: Point,
     edge: Option<HighlightEdge>,
+}
+
+struct FormEdit {
+    window: HWND,
+    index: usize,
+    bounds: (Point, Point),
+    original: String,
+    multiline: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -216,10 +227,12 @@ struct App {
     zoom: Option<u16>,
     zoom_picker: HWND,
     page_picker: HWND,
+    page_arrows: [(u16, HWND); 2],
     drag: Option<Drag>,
     selected_highlight: Option<(usize, (Point, Point))>,
     highlight_band: (f32, f32),
     text_at: Option<Point>,
+    form_edit: Option<FormEdit>,
     signature_group: u64,
     pan: Point,
     size: Point,
@@ -260,10 +273,12 @@ impl App {
             zoom: None,
             zoom_picker: HWND::default(),
             page_picker: HWND::default(),
+            page_arrows: [(PREVIOUS, HWND::default()), (NEXT, HWND::default())],
             drag: None,
             selected_highlight: None,
             highlight_band: (0.0, 0.0),
             text_at: None,
+            form_edit: None,
             signature_group: 0,
             pan: (0.0, 0.0),
             size: (0.0, 0.0),
@@ -375,6 +390,15 @@ impl App {
                 }
             }
             self.header = px(MENU_ROW + chrome::HEADER + row * 42);
+            let area = self.viewport();
+            let arrow = px(PAGE_ARROW_SIZE);
+            let inset = px(PAGE_ARROW_INSET);
+            let y = ((area.top + area.bottom - arrow as f32) / 2.0).round() as i32;
+            for ((_, button), x) in self.page_arrows.into_iter().zip([inset, w - inset - arrow]) {
+                if !button.is_invalid() {
+                    MoveWindow(button, x, y, arrow, arrow, true)?;
+                }
+            }
             let hero_top = (self.header + h - self.footer - px(chrome::HERO_H)) / 2;
             MoveWindow(
                 self.open_button,
@@ -403,17 +427,25 @@ impl App {
 
     fn viewport(&self) -> D2D_RECT_F {
         let top = self.header as f32;
+        let width = self.width as f32;
+        let gutter = if self.doc.as_ref().is_some_and(|doc| doc.count() > 1) {
+            ((PAGE_ARROW_SIZE + 2 * PAGE_ARROW_INSET) as f32 * self.dpi)
+                .round()
+                .min(width / 2.0)
+        } else {
+            0.0
+        };
         D2D_RECT_F {
-            left: 0.0,
+            left: gutter,
             top,
-            right: self.width as f32,
+            right: width - gutter,
             bottom: (self.height.saturating_sub(self.footer as u32) as f32).max(top),
         }
     }
 
     fn fit_scale(&self) -> f32 {
         let area = self.viewport();
-        ((area.right - 32.0).max(1.0) / self.size.0)
+        ((area.right - area.left - 32.0).max(1.0) / self.size.0)
             .min((area.bottom - area.top - 32.0).max(1.0) / self.size.1)
     }
 
@@ -423,7 +455,7 @@ impl App {
 
     fn can_pan(&self) -> bool {
         let area = self.viewport();
-        self.page_rect.right - self.page_rect.left + 32.0 > area.right + 0.5
+        self.page_rect.right - self.page_rect.left + 32.0 > area.right - area.left + 0.5
             || self.page_rect.bottom - self.page_rect.top + 32.0 > area.bottom - area.top + 0.5
     }
 
@@ -538,13 +570,32 @@ impl App {
     }
 
     fn position_editor(&self) {
+        if let Some(edit) = &self.form_edit {
+            let (a, b) = self.form_rect(edit.bounds);
+            let area = self.viewport();
+            let width = (b.x - a.x)
+                .max((64.0 * self.dpi).round() as i32)
+                .min((area.right - area.left) as i32);
+            let height = (b.y - a.y).max((24.0 * self.dpi).round() as i32);
+            let x = a.x.clamp(
+                area.left as i32,
+                (area.right as i32 - width).max(area.left as i32),
+            );
+            let y = a.y.clamp(
+                area.top as i32,
+                (area.bottom as i32 - height).max(area.top as i32),
+            );
+            unsafe {
+                let _ = MoveWindow(edit.window, x, y, width, height, true);
+            }
+        }
         if let Some(at) = self.text_at {
             let r = self.page_rect;
             let area = self.viewport();
-            let editor_width = (260.0 * self.dpi).round().min(area.right);
+            let editor_width = (260.0 * self.dpi).round().min(area.right - area.left);
             let editor_height = (29.0 * self.dpi).round();
-            let x =
-                (r.left + at.0 * (r.right - r.left) - 3.0).clamp(0.0, area.right - editor_width);
+            let x = (r.left + at.0 * (r.right - r.left) - 3.0)
+                .clamp(area.left, area.right - editor_width);
             let y = (r.top + at.1 * (r.bottom - r.top) - 4.0)
                 .clamp(area.top, area.top.max(area.bottom - editor_height));
             unsafe {
@@ -560,6 +611,15 @@ impl App {
         }
     }
 
+    fn form_rect(&self, (a, b): (Point, Point)) -> (POINT, POINT) {
+        let rect = self.page_rect;
+        let to_client = |(x, y): Point| POINT {
+            x: (rect.left + x * (rect.right - rect.left)).round() as i32,
+            y: (rect.top + y * (rect.bottom - rect.top)).round() as i32,
+        };
+        (to_client(a), to_client(b))
+    }
+
     fn layout(&mut self) {
         let (w, h) = self.size;
         if w <= 0.0 || h <= 0.0 {
@@ -567,7 +627,7 @@ impl App {
             return;
         }
         let area = self.viewport();
-        let viewport = (area.right, area.bottom - area.top);
+        let viewport = (area.right - area.left, area.bottom - area.top);
         let scale = self.zoom.map_or_else(
             || self.fit_scale(),
             |percent| percent as f32 * self.actual_scale() / 100.0,
@@ -579,7 +639,7 @@ impl App {
         );
         self.pan.0 = self.pan.0.clamp(-overflow.0, overflow.0);
         self.pan.1 = self.pan.1.clamp(-overflow.1, overflow.1);
-        let left = ((viewport.0 - w) / 2.0 + self.pan.0).round();
+        let left = (area.left + (viewport.0 - w) / 2.0 + self.pan.0).round();
         let top = (area.top + (viewport.1 - h) / 2.0 + self.pan.1).round();
         self.page_rect = D2D_RECT_F {
             left,
@@ -683,7 +743,7 @@ impl App {
             let _ = InvalidateRect(self.status, None, true);
             let _ = InvalidateRect(self.editor, None, true);
         }
-        for &(_, button) in &self.menu_buttons {
+        for &(_, button) in self.menu_buttons.iter().chain(&self.page_arrows) {
             repaint(button);
         }
         repaint(self.open_button);
@@ -706,6 +766,16 @@ impl App {
             for ((_, button), (_, label, _)) in self.toolbar.iter().zip(chrome::TOOLS) {
                 let _ = SetWindowTextW(*button, PCWSTR(wide(language.text(*label)).as_ptr()));
                 repaint(*button);
+            }
+            for (id, button) in self.page_arrows {
+                if !button.is_invalid() {
+                    let label = if id == PREVIOUS {
+                        ("Halaman sebelumnya", "Previous page")
+                    } else {
+                        ("Halaman berikutnya", "Next page")
+                    };
+                    SetWindowTextW(button, PCWSTR(wide(language.text(label)).as_ptr()))?;
+                }
             }
             let _ = SetWindowTextW(
                 self.open_button,
@@ -736,6 +806,14 @@ impl App {
             None => ("HubbyPDF".into(), false),
         };
         let hint = language.text(match self.tool {
+            READ if self.form_edit.is_some() => (
+                "Enter untuk menyimpan nilai kolom · Esc untuk batal.",
+                "Enter to apply the field value · Esc to cancel.",
+            ),
+            READ if self.doc.as_ref().is_some_and(Document::has_form) && !dirty => (
+                "Klik kolom formulir untuk mengisi.",
+                "Click a form field to fill it in.",
+            ),
             TEXT if self.text_at.is_some() => (
                 "Ketik teks · Enter untuk menempatkan, Esc untuk batal.",
                 "Type text · Enter to place, Esc to cancel.",
@@ -791,6 +869,25 @@ impl App {
             );
             let _ = EnableWindow(self.zoom_picker, self.doc.is_some());
             page_picker::sync(self.page_picker, self.doc.as_ref());
+            let area = self.viewport();
+            for (id, button) in self.page_arrows {
+                if button.is_invalid() {
+                    continue;
+                }
+                let visible = area.bottom - area.top >= PAGE_ARROW_SIZE as f32 * self.dpi
+                    && self.doc.as_ref().is_some_and(|doc| doc.count() > 1);
+                let enabled = self.doc.as_ref().is_some_and(|doc| match id {
+                    PREVIOUS => doc.index > 0,
+                    _ => doc.index + 1 < doc.count(),
+                });
+                // Keep keyboard navigation on the canvas once the focused arrow reaches an end.
+                if !enabled && GetFocus() == button {
+                    let _ = SetFocus(hwnd);
+                }
+                let _ = EnableWindow(button, enabled);
+                let _ = ShowWindow(button, if visible { SW_SHOWNA } else { SW_HIDE });
+                repaint(button);
+            }
             // Owner-drawn buttons can request a synchronous repaint during WM_SETTEXT.
             let _ = PostMessageW(hwnd, WM_SYNC_ZOOM_LABEL, WPARAM(0), LPARAM(0));
             for &(id, button) in &self.toolbar {
@@ -875,6 +972,7 @@ impl App {
     }
 
     fn go_to_page(&mut self, hwnd: HWND, index: u16) -> Result<()> {
+        self.finish_form(hwnd, true)?;
         let Some(doc) = self.doc.as_mut() else {
             return Ok(());
         };
@@ -967,6 +1065,7 @@ impl App {
     }
 
     fn command(&mut self, hwnd: HWND, id: u16) -> Result<()> {
+        self.finish_form(hwnd, true)?;
         self.notice = None;
         if (MENU_FILE..=MENU_LANGUAGE).contains(&id) {
             return self.show_menu(hwnd, id);
@@ -1176,7 +1275,9 @@ impl App {
         );
         if clamp {
             Some((point.0.clamp(0.0, 1.0), point.1.clamp(0.0, 1.0)))
-        } else if y >= self.viewport().top
+        } else if x >= self.viewport().left
+            && x < self.viewport().right
+            && y >= self.viewport().top
             && y < self.viewport().bottom
             && (0.0..=1.0).contains(&point.0)
             && (0.0..=1.0).contains(&point.1)
@@ -1267,6 +1368,160 @@ impl App {
         }
     }
 
+    fn click_form(&mut self, hwnd: HWND, field: forms::Field) -> Result<()> {
+        use forms::Control;
+        match field.control {
+            Control::Text {
+                value,
+                multiline,
+                password,
+            } => {
+                let style = if multiline {
+                    ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN
+                } else {
+                    ES_AUTOHSCROLL
+                } | if password && !multiline {
+                    ES_PASSWORD
+                } else {
+                    0
+                };
+                let editor_value = if multiline {
+                    forms::normalize_lines(&value).replace('\n', "\r\n")
+                } else {
+                    value.clone()
+                };
+                let window = unsafe {
+                    CreateWindowExW(
+                        WS_EX_CLIENTEDGE,
+                        w!("EDIT"),
+                        PCWSTR(wide(&editor_value).as_ptr()),
+                        WS_CHILD | WS_TABSTOP | WINDOW_STYLE(style as u32),
+                        0,
+                        0,
+                        0,
+                        0,
+                        hwnd,
+                        None,
+                        GetModuleHandleW(None)?,
+                        None,
+                    )?
+                };
+                self.form_edit = Some(FormEdit {
+                    window,
+                    index: field.index,
+                    bounds: field.bounds,
+                    original: editor_value,
+                    multiline,
+                });
+                self.position_editor();
+                unsafe {
+                    SendMessageW(window, WM_SETFONT, WPARAM(self.font.0 as usize), LPARAM(1));
+                    let _ = ShowWindow(window, SW_SHOW);
+                    let _ = SetFocus(window);
+                    SendMessageW(
+                        window,
+                        windows::Win32::UI::Controls::EM_SETSEL,
+                        WPARAM(0),
+                        LPARAM(-1),
+                    );
+                }
+            }
+            Control::Choice(options) => {
+                let (a, b) = self.form_rect(field.bounds);
+                let mut anchor = POINT {
+                    x: a.x.max(0),
+                    y: b.y.min(self.viewport().bottom as i32),
+                };
+                let picked = unsafe {
+                    let _ = ClientToScreen(hwnd, &mut anchor);
+                    let menu = CreatePopupMenu()?;
+                    let result = (|| -> Result<i32> {
+                        for (i, option) in options.iter().enumerate() {
+                            let label = option.label().map_or("", String::as_str);
+                            let label = if label.is_empty() {
+                                self.language.text(("(Kosong)", "(Empty)")).to_owned()
+                            } else {
+                                label.replace('&', "&&").replace(['\r', '\n', '\t'], " ")
+                            };
+                            let checked = if option.is_set() {
+                                MF_CHECKED
+                            } else {
+                                MF_UNCHECKED
+                            };
+                            AppendMenuW(
+                                menu,
+                                MF_STRING | checked,
+                                i + 1,
+                                PCWSTR(wide(&label).as_ptr()),
+                            )?;
+                        }
+                        Ok(TrackPopupMenuEx(
+                            menu,
+                            (TPM_RETURNCMD | TPM_NONOTIFY).0,
+                            anchor.x,
+                            anchor.y,
+                            hwnd,
+                            None,
+                        )
+                        .0)
+                    })();
+                    let _ = DestroyMenu(menu);
+                    result?
+                };
+                if let Ok(i) = usize::try_from(picked - 1)
+                    && let Some(option) = options.get(i)
+                    && !option.is_set()
+                    && let Some(doc) = self.doc.as_mut()
+                {
+                    doc.fill(field.index, forms::Value::Choice(option.index() as i32))?;
+                    self.refresh(hwnd)?;
+                }
+            }
+            Control::Checkbox => {
+                if let Some(doc) = self.doc.as_mut() {
+                    doc.fill(field.index, forms::Value::Toggle)?;
+                    self.refresh(hwnd)?;
+                }
+            }
+            Control::ReadOnly => {
+                self.notice = Some(
+                    self.language
+                        .text(("Kolom ini hanya-baca.", "This field is read-only."))
+                        .into(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_form(&mut self, hwnd: HWND, commit: bool) -> Result<()> {
+        let Some(edit) = &self.form_edit else {
+            return Ok(());
+        };
+        let mut changed = false;
+        if commit {
+            let len = unsafe { GetWindowTextLengthW(edit.window) }.max(0) as usize;
+            let mut buffer = vec![0; len + 1];
+            let count = unsafe { GetWindowTextW(edit.window, &mut buffer) } as usize;
+            let text = String::from_utf16_lossy(&buffer[..count]);
+            if text != edit.original
+                && let Some(doc) = self.doc.as_mut()
+            {
+                doc.fill(edit.index, forms::Value::Text(text))?;
+                changed = true;
+            }
+        }
+        let edit = self.form_edit.take().unwrap();
+        unsafe {
+            DestroyWindow(edit.window)?;
+            let _ = SetFocus(hwnd);
+        }
+        if changed {
+            self.refresh(hwnd)?;
+        }
+        self.sync(hwnd);
+        Ok(())
+    }
     fn place_text(&mut self, hwnd: HWND) -> Result<()> {
         let Some(point) = self.text_at else {
             return Ok(());
@@ -1553,6 +1808,7 @@ fn process_message(
             return Ok(true);
         }
         WM_LBUTTONDOWN => {
+            app.finish_form(hwnd, true)?;
             if let Some(point) = app.point(lparam, false) {
                 if app.tool == ERASE {
                     let tolerance = app.hit_tolerance();
@@ -1577,6 +1833,15 @@ fn process_message(
                     app.begin_text(hwnd, point);
                 } else if app.tool == READ {
                     app.selected_highlight = None;
+                    app.notice = None;
+                    if let Some(doc) = &app.doc
+                        && let Some(field) = doc.form_at(point)?
+                    {
+                        app.click_form(hwnd, field)?;
+                        app.sync(hwnd);
+                        repaint(hwnd);
+                        return Ok(true);
+                    }
                     let tolerance = app.hit_tolerance();
                     if let Some((ids, bounds)) =
                         app.doc.as_ref().and_then(|doc| doc.hit(point, tolerance))
@@ -1829,6 +2094,23 @@ fn keyboard(hwnd: HWND, message: &MSG) -> bool {
         let ctrl = key_down(VK_CONTROL);
         let editing = message.hwnd == app.editor;
         let key = VIRTUAL_KEY(message.wParam.0 as u16);
+        if let Some(edit) = &app.form_edit
+            && message.hwnd == edit.window
+        {
+            let close = key == VK_ESCAPE
+                || !ctrl
+                    && (key == VK_TAB
+                        || key == VK_RETURN && !(edit.multiline && key_down(VK_SHIFT)));
+            if close {
+                if let Err(error) = app.finish_form(hwnd, key != VK_ESCAPE) {
+                    show_error(hwnd, app.language, error.as_ref());
+                }
+                return true;
+            }
+            if !(ctrl && key == VIRTUAL_KEY(0x53) && key_down(VK_SHIFT)) {
+                return false;
+            }
+        }
         if message.message == WM_SYSKEYDOWN {
             let id = match key.0 {
                 0x46 => MENU_FILE,
@@ -1850,6 +2132,7 @@ fn keyboard(hwnd: HWND, message: &MSG) -> bool {
             .toolbar
             .iter()
             .chain(&app.menu_buttons)
+            .chain(&app.page_arrows)
             .find(|(_, button)| *button == message.hwnd)
             .map(|(id, _)| *id);
         if key == VK_TAB && !ctrl {
@@ -1862,6 +2145,8 @@ fn keyboard(hwnd: HWND, message: &MSG) -> bool {
                     app.editor,
                     app.open_button,
                     app.page_picker,
+                    app.page_arrows[0].1,
+                    app.page_arrows[1].1,
                     app.zoom_picker,
                 ])
                 .filter(|control| unsafe {
@@ -1995,6 +2280,29 @@ fn make_menu(language: Language) -> Result<HMENU> {
     }
 }
 
+fn create_page_arrows(hwnd: HWND, arrows: &mut [(u16, HWND); 2]) -> Result<()> {
+    let instance = unsafe { GetModuleHandleW(None)? };
+    for (id, button) in arrows {
+        *button = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("BUTTON"),
+                w!(""),
+                WS_CHILD | WS_TABSTOP | WINDOW_STYLE(BS_OWNERDRAW as u32),
+                0,
+                0,
+                0,
+                0,
+                hwnd,
+                HMENU(*id as usize as *mut _),
+                instance,
+                None,
+            )?
+        };
+    }
+    Ok(())
+}
+
 fn run(language: Language) -> Result<()> {
     let exe = std::env::current_exe()?;
     let engine = Box::leak(Box::new(load_pdfium(
@@ -2107,6 +2415,7 @@ fn run(language: Language) -> Result<()> {
             None,
         )?;
         app.page_picker = page_picker::create(hwnd)?;
+        create_page_arrows(hwnd, &mut app.page_arrows)?;
         for &(id, _, _) in chrome::TOOLS {
             let button = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
@@ -2215,6 +2524,7 @@ fn verify_window_controls(engine: &'static Pdfium, source: &Path) -> Result<()> 
         app.editor = button;
         app.open_button = button;
         app.page_picker = page_picker::create(parent)?;
+        create_page_arrows(parent, &mut app.page_arrows)?;
         app.doc = Some(Document::open(engine, source.to_owned())?);
         page_picker::populate(app.page_picker, app.doc.as_ref().unwrap().count())?;
         for &(id, _, _) in chrome::TOOLS {
@@ -2238,7 +2548,32 @@ fn verify_window_controls(engine: &'static Pdfium, source: &Path) -> Result<()> 
         app.set_language(Language::Indonesian)?;
         app.resize(parent)?;
         page_picker::sync(app.page_picker, app.doc.as_ref());
+        app.sync(parent);
         assert_eq!(page_picker::selection(app.page_picker), Some(0));
+        assert!(!IsWindowEnabled(app.page_arrows[0].1).as_bool());
+        assert!(IsWindowEnabled(app.page_arrows[1].1).as_bool());
+        let area = app.viewport();
+        let mut origin = POINT::default();
+        assert!(ClientToScreen(parent, &mut origin).as_bool());
+        let mut left = RECT::default();
+        let mut right = RECT::default();
+        GetWindowRect(app.page_arrows[0].1, &mut left)?;
+        GetWindowRect(app.page_arrows[1].1, &mut right)?;
+        assert!(left.right - origin.x <= area.left as i32);
+        assert!(right.left - origin.x >= area.right as i32);
+        app.zoom = Some(200);
+        app.size = app.doc.as_ref().unwrap().size()?;
+        app.layout();
+        assert!(app.can_pan());
+        let command = |id| WPARAM(id as usize);
+        process_message(&mut app, parent, WM_COMMAND, command(NEXT), LPARAM(0))?;
+        assert_eq!(app.doc.as_ref().unwrap().index, 1);
+        assert_eq!(app.zoom, Some(200));
+        assert!(!IsWindowEnabled(app.page_arrows[1].1).as_bool());
+        process_message(&mut app, parent, WM_COMMAND, command(PREVIOUS), LPARAM(0))?;
+        assert_eq!(app.doc.as_ref().unwrap().index, 0);
+        assert_eq!(app.zoom, Some(200));
+        app.zoom = None;
         assert_eq!(
             SendMessageW(app.page_picker, CB_GETCOUNT, WPARAM(0), LPARAM(0)).0,
             2
