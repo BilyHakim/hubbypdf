@@ -229,6 +229,7 @@ struct App {
     page_picker: HWND,
     page_arrows: [(u16, HWND); 2],
     drag: Option<Drag>,
+    selection: Option<(Vec<usize>, (Point, Point))>,
     selected_highlight: Option<(usize, (Point, Point))>,
     highlight_band: (f32, f32),
     text_at: Option<Point>,
@@ -275,6 +276,7 @@ impl App {
             page_picker: HWND::default(),
             page_arrows: [(PREVIOUS, HWND::default()), (NEXT, HWND::default())],
             drag: None,
+            selection: None,
             selected_highlight: None,
             highlight_band: (0.0, 0.0),
             text_at: None,
@@ -462,6 +464,7 @@ impl App {
     fn zoom_to(&mut self, hwnd: HWND, zoom: Option<u16>) -> Result<()> {
         self.zoom = zoom;
         self.drag = None;
+        self.selection = None;
         self.gesture.clear();
         if zoom.is_none() {
             self.pan = (0.0, 0.0);
@@ -965,6 +968,7 @@ impl App {
         self.gesture.clear();
         self.zoom = None;
         self.drag = None;
+        self.selection = None;
         self.selected_highlight = None;
         self.text_at = None;
         self.pan = (0.0, 0.0);
@@ -983,6 +987,7 @@ impl App {
         self.notice = None;
         self.gesture.clear();
         self.drag = None;
+        self.selection = None;
         self.selected_highlight = None;
         self.text_at = None;
         self.pan = (0.0, 0.0);
@@ -1178,6 +1183,7 @@ impl App {
         };
         self.gesture.clear();
         self.drag = None;
+        self.selection = None;
         if matches!(
             id,
             UNDO | READ | TEXT | HIGHLIGHT | SKETCH | SIGN | ERASE | SHAPE
@@ -1344,12 +1350,20 @@ impl App {
             return Some(Preview::Selection(a, b, self.selected_highlight.is_some()));
         }
         if self.gesture.len() < 2 {
+            if let Some((_, (a, b))) = &self.selection {
+                return Some(Preview::Selection(*a, *b, false));
+            }
             return self
                 .selected_highlight
                 .map(|(_, (a, b))| Preview::Selection(a, b, true));
         }
         let (a, b) = (self.gesture[0], *self.gesture.last()?);
         match self.tool {
+            READ => Some(Preview::Selection(
+                (a.0.min(b.0), a.1.min(b.1)),
+                (a.0.max(b.0), a.1.max(b.1)),
+                false,
+            )),
             SKETCH | SIGN => Some(Preview::Ink(Cow::Borrowed(&self.gesture), self.ink_color())),
             SHAPE => Some(Preview::Ink(
                 Cow::Owned(SHAPES[self.shape].1.points(a, b, self.size)),
@@ -1593,6 +1607,12 @@ impl App {
         };
         points.push(end);
         match self.tool {
+            READ => {
+                self.selection = self
+                    .doc
+                    .as_ref()
+                    .and_then(|doc| doc.select_area(start, end));
+            }
             SKETCH | SIGN if points.windows(2).any(|pair| pair[0] != pair[1]) => self.add(
                 hwnd,
                 Mark::Ink(
@@ -1855,6 +1875,25 @@ fn process_message(
                 } else if app.tool == TEXT {
                     app.begin_text(hwnd, point);
                 } else if app.tool == READ {
+                    if let Some((ids, bounds)) = &app.selection
+                        && point.0 >= bounds.0.0
+                        && point.0 <= bounds.1.0
+                        && point.1 >= bounds.0.1
+                        && point.1 <= bounds.1.1
+                    {
+                        app.drag = Some(Drag {
+                            ids: ids.clone(),
+                            bounds: *bounds,
+                            start: point,
+                            delta: (0.0, 0.0),
+                            edge: None,
+                        });
+                        unsafe {
+                            SetCapture(hwnd);
+                        }
+                        return Ok(true);
+                    }
+                    app.selection = None;
                     app.selected_highlight = None;
                     app.notice = None;
                     if let Some(doc) = &app.doc
@@ -1879,6 +1918,11 @@ fn process_message(
                             delta: (0.0, 0.0),
                             edge: None,
                         });
+                        unsafe {
+                            SetCapture(hwnd);
+                        }
+                    } else {
+                        app.gesture = vec![point];
                         unsafe {
                             SetCapture(hwnd);
                         }
@@ -1927,7 +1971,10 @@ fn process_message(
                         Some(HighlightEdge::Bottom) => {
                             doc.resize_highlight(drag.ids[0], (0.0, drag.delta.1))?
                         }
-                        None => doc.move_mark(drag.ids, drag.delta)?,
+                        None => {
+                            app.selection = Some((drag.ids.clone(), bounds));
+                            doc.move_mark(drag.ids, drag.delta)?;
+                        }
                     }
                     if let Some((_, selected)) = &mut app.selected_highlight {
                         *selected = bounds;
@@ -1939,7 +1986,7 @@ fn process_message(
         }
         WM_MOUSEMOVE if !app.gesture.is_empty() => {
             if let Some(point) = app.point(lparam, true) {
-                if matches!(app.tool, HIGHLIGHT | PNG | SHAPE) {
+                if matches!(app.tool, READ | HIGHLIGHT | PNG | SHAPE) {
                     app.gesture.truncate(1);
                 }
                 if app.gesture.last() != Some(&point) {

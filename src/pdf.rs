@@ -380,6 +380,54 @@ impl Document {
         self.hit_mark(point, tolerance, false)
     }
 
+    pub fn select_area(&self, start: Point, end: Point) -> Option<(Vec<usize>, MarkBounds)> {
+        let left = (start.0.min(end.0), start.1.min(end.1));
+        let right = (start.0.max(end.0), start.1.max(end.1));
+        let offsets = Self::offsets(&self.edits);
+        let erased = Self::erased(&self.edits);
+        let mut groups: HashMap<usize, Vec<(usize, MarkBounds)>> = HashMap::new();
+        for (id, (page, edit, _)) in self.edits.iter().enumerate() {
+            if *page != self.index || erased.contains(&id) {
+                continue;
+            }
+            if let Edit::Add(mark, Some((a, b))) = edit {
+                let (da, db) = offsets.get(&id).copied().unwrap_or_default();
+                // Signature strokes form one selectable element.
+                let key = if let Mark::Ink(_, Some(group), _) = mark {
+                    self.edits
+                        .iter()
+                        .position(|(p, e, _)| {
+                            *p == self.index
+                                && matches!(e, Edit::Add(Mark::Ink(_, Some(g), _), _) if g == group)
+                        })
+                        .unwrap_or(id)
+                } else {
+                    id
+                };
+                groups
+                    .entry(key)
+                    .or_default()
+                    .push((id, (translate(*a, da), translate(*b, db))));
+            }
+        }
+        let mut ids = Vec::new();
+        let mut a = (1.0_f32, 1.0_f32);
+        let mut b = (0.0_f32, 0.0_f32);
+        for marks in groups.values() {
+            if marks.iter().all(|(_, (a, b))| {
+                a.0 >= left.0 && a.1 >= left.1 && b.0 <= right.0 && b.1 <= right.1
+            }) {
+                for (id, (min, max)) in marks {
+                    ids.push(*id);
+                    a = (a.0.min(min.0), a.1.min(min.1));
+                    b = (b.0.max(max.0), b.1.max(max.1));
+                }
+            }
+        }
+        ids.sort_unstable();
+        (!ids.is_empty()).then_some((ids, (a, b)))
+    }
+
     fn hit_mark(
         &self,
         point: Point,
@@ -793,6 +841,23 @@ mod tests {
         doc.add(Mark::Signature((0.1, 0.45), (0.3, 0.5), rgba.into()))?;
         let tolerance = (0.003, 0.003);
         let before = doc.render(420, 594)?.bytes;
+        let (selected, bounds) = doc.select_area((0.0, 0.0), (1.0, 1.0)).unwrap();
+        assert_eq!(selected.len(), 5);
+        assert_eq!(doc.select_area((1.0, 1.0), (0.0, 0.0)).unwrap().0, selected);
+        assert!(doc.select_area((0.8, 0.8), (0.9, 0.9)).is_none());
+        assert!(doc.select_area((0.16, 0.26), (0.20, 0.28)).is_none());
+        doc.move_mark(selected.clone(), (0.1, 0.1))?;
+        assert_eq!(
+            doc.select_area(
+                translate(bounds.0, (0.1, 0.1)),
+                translate(bounds.1, (0.1, 0.1))
+            )
+            .unwrap()
+            .0,
+            selected
+        );
+        doc.undo()?;
+        assert_eq!(doc.render(420, 594)?.bytes, before);
         assert!(!doc.erase_at((0.16, 0.29), tolerance)?);
         for point in [
             (0.12, 0.605),
