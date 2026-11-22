@@ -2,9 +2,15 @@
 
 Pembaca dan penyunting PDF lokal untuk Windows x64. HubbyPDF menggunakan Rust, kontrol Win32, Direct2D untuk menampilkan halaman, dan PDFium untuk membaca serta menyimpan PDF. Aplikasi merender satu halaman dan membatasi sisi terpanjang bitmap hingga 4.096 piksel dan total sekitar 9,5 juta piksel.
 
+## Instalasi di Windows
+
+Jalankan `HubbyPDF-0.1.0-x64.msi` pada Windows 10 atau 11 x64. Installer memerlukan izin administrator dan memasang HubbyPDF ke Program Files, menambahkan shortcut ke Start Menu, serta mendaftarkannya sebagai pembuka PDF. File MSI yang sama bisa disalin ke komputer Windows x64 lain.
+
+Untuk menjadikan HubbyPDF pembuka PDF default, buka **Settings → Apps → Default apps**, cari `.pdf`, lalu pilih **HubbyPDF**. Aplikasi dapat dihapus dari daftar aplikasi terinstal di Windows.
+
 ## Membuka aplikasi
 
-Jalankan `target/HubbyPDF/HubbyPDF.exe`. Jika dipindahkan ke komputer lain, salin seluruh folder `target/HubbyPDF` agar DLL dan lisensi PDFium ikut terbawa.
+Buka **HubbyPDF** dari Start Menu setelah instalasi, atau jalankan versi portabel di `target/HubbyPDF/HubbyPDF.exe`. Untuk memindahkan versi portabel, salin seluruh folder `target/HubbyPDF` agar DLL dan lisensi PDFium ikut terbawa.
 
 - Klik **Tema** di kanan atas atau pilih **Tampilan → Tema gelap**. HubbyPDF mengingat pilihan tema dan menampilkan PDF dengan warna aslinya.
 - Pilih **Bahasa → Bahasa Indonesia** atau **Bahasa → English**. HubbyPDF mengingat pilihan bahasa.
@@ -32,6 +38,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ./build.ps1 -Test
 ```
 
 Skrip mengunduh PDFium Windows x64 pada build pertama, memeriksa SHA-256 arsip, dan menyalin aplikasi serta dependensi runtime ke `target/HubbyPDF`. Opsi `-Test` menjalankan pengujian PDF nyata yang memverifikasi render, teks, sorotan, sketsa, tanda tangan, simpan salinan, dan undo.
+
+### Build installer
+
+Ekstrak [WiX Toolset 3.14.1 binaries](https://github.com/wixtoolset/wix3/releases/tag/wix3141rtm) ke `target/wix314` atau tentukan folder bin WiX dengan parameter `-WixBin`. Build menggunakan `rc.exe` dari Windows SDK dan mengonversi `assets/hubbypdf.png` menjadi ikon Windows.
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File ./build-installer.ps1 -Test
+```
+
+MSI dibuat di `target/installer`. Installer mengambil versi dari `Cargo.toml`. Naikkan versi tersebut saat merilis pembaruan.
 
 
 

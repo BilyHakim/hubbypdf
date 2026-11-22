@@ -2538,6 +2538,7 @@ fn run(language: Language) -> Result<()> {
         let class = WNDCLASSW {
             lpfnWndProc: Some(window_proc),
             hInstance: instance.into(),
+            hIcon: LoadIconW(instance, PCWSTR(1_usize as *const u16)).unwrap_or_default(),
             hCursor: LoadCursorW(None, IDC_ARROW)?,
             hbrBackground: GetSysColorBrush(COLOR_BTNFACE),
             lpszClassName: w!("HubbyPdfWindow"),
