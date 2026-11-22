@@ -6,6 +6,7 @@ mod drawing;
 mod forms;
 mod page_picker;
 mod pdf;
+mod recent;
 
 use std::{
     borrow::Cow,
@@ -21,6 +22,7 @@ use drawing::{COLORS, SHAPES};
 use image::{DynamicImage, ImageReader};
 use pdf::{Document, Mark, Point, Result};
 use pdfium_render::prelude::{PdfColor, Pdfium};
+use recent::RecentPdfs;
 use windows::{
     Win32::{
         Foundation::*,
@@ -63,6 +65,8 @@ const MENU_LANGUAGE: u16 = 143;
 const INDONESIAN: u16 = 144;
 const ENGLISH: u16 = 145;
 const PAGE_PICKER: u16 = 146;
+const FIRST_RECENT_PDF: u16 = 200;
+const FILE_RECENT_POSITION: i32 = 1;
 const MENU_ROW: i32 = 28;
 const PAGE_ARROW_SIZE: i32 = 36;
 const PAGE_ARROW_INSET: i32 = 10;
@@ -203,6 +207,7 @@ thread_local! {
 struct App {
     engine: &'static Pdfium,
     doc: Option<Document>,
+    recent: RecentPdfs,
     canvas: Option<Canvas>,
     status: HWND,
     open_button: HWND,
@@ -250,6 +255,7 @@ impl App {
         Self {
             engine,
             doc: None,
+            recent: RecentPdfs::default(),
             canvas: None,
             status: HWND::default(),
             open_button: HWND::default(),
@@ -477,6 +483,13 @@ impl App {
             let mut anchor = RECT::default();
             GetWindowRect(self.menu_buttons[index].1, &mut anchor)?;
             let popup = GetSubMenu(self.menu, index as i32);
+            if id == MENU_FILE {
+                populate_recent_menu(
+                    GetSubMenu(popup, FILE_RECENT_POSITION),
+                    self.recent.paths(),
+                    self.language,
+                )?;
+            }
             TrackPopupMenuEx(
                 popup,
                 (TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN).0,
@@ -969,7 +982,19 @@ impl App {
         self.selected_highlight = None;
         self.text_at = None;
         self.pan = (0.0, 0.0);
-        self.resize(hwnd)
+        self.resize(hwnd)?;
+        if self
+            .recent
+            .remember(&self.doc.as_ref().unwrap().source)
+            .is_err()
+        {
+            self.notice = Some(
+                self.language
+                    .text(("Riwayat PDF gagal disimpan.", "Could not save recent PDFs."))
+                    .into(),
+            );
+        }
+        Ok(())
     }
 
     fn go_to_page(&mut self, hwnd: HWND, index: u16) -> Result<()> {
@@ -1151,6 +1176,26 @@ impl App {
                 && self.discard_allowed(hwnd)
             {
                 self.open(hwnd, path)?;
+            }
+            return Ok(());
+        }
+        if let Some(index) = id.checked_sub(FIRST_RECENT_PDF)
+            && let Some(path) = self.recent.paths().get(usize::from(index)).cloned()
+        {
+            if self.discard_allowed(hwnd)
+                && let Err(error) = self.open(hwnd, path)
+            {
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                {
+                    return Err(Message((
+                        "PDF ini tidak ditemukan. Jika dipindahkan, buka dari lokasi barunya.",
+                        "This PDF could not be found. If it was moved, open it from its new location.",
+                    ))
+                    .into());
+                }
+                return Err(error);
             }
             return Ok(());
         }
@@ -2378,6 +2423,42 @@ fn load_pdfium(folder: &Path, language: Language) -> Result<Pdfium> {
     )?))
 }
 
+fn populate_recent_menu(menu: HMENU, paths: &[PathBuf], language: Language) -> Result<()> {
+    unsafe {
+        for index in (0..GetMenuItemCount(menu)).rev() {
+            DeleteMenu(menu, index as u32, MF_BYPOSITION)?;
+        }
+        if paths.is_empty() {
+            let label = language.text(("Belum ada riwayat", "No recent PDFs"));
+            AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, PCWSTR(wide(label).as_ptr()))?;
+        }
+        for (index, path) in paths.iter().enumerate() {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let folder = path.parent().unwrap_or(Path::new("")).to_string_lossy();
+            let label = format!(
+                "{}  ({})",
+                compact_menu_text(&name, 48),
+                compact_menu_text(&folder, 40),
+            )
+            .replace('&', "&&");
+            AppendMenuW(
+                menu,
+                MF_STRING,
+                usize::from(FIRST_RECENT_PDF) + index,
+                PCWSTR(wide(&label).as_ptr()),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn compact_menu_text(text: &str, limit: usize) -> Cow<'_, str> {
+    match text.char_indices().rev().nth(limit - 1) {
+        Some((offset, _)) if offset > 0 => format!("…{}", &text[offset..]).into(),
+        _ => text.into(),
+    }
+}
+
 fn make_menu(language: Language) -> Result<HMENU> {
     unsafe {
         let menu = CreateMenu()?;
@@ -2394,6 +2475,19 @@ fn make_menu(language: Language) -> Result<HMENU> {
                     id as usize,
                     PCWSTR(wide(language.text(name)).as_ptr()),
                 )?;
+                if id == OPEN {
+                    let recent = CreatePopupMenu()?;
+                    let label = language.text(("PDF &terakhir dibuka", "&Recent PDFs"));
+                    if let Err(error) = AppendMenuW(
+                        child,
+                        MF_POPUP,
+                        recent.0 as usize,
+                        PCWSTR(wide(label).as_ptr()),
+                    ) {
+                        let _ = DestroyMenu(recent);
+                        return Err(error.into());
+                    }
+                }
             }
             AppendMenuW(
                 menu,
@@ -2467,6 +2561,7 @@ fn run(language: Language) -> Result<()> {
             None,
         )?;
         let mut app = App::new(engine, language);
+        app.recent = RecentPdfs::load(chrome::preference_file("recent-pdfs.dat"));
         for &(id, _) in MENU_BUTTONS {
             let button = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
@@ -2651,6 +2746,11 @@ fn verify_window_controls(engine: &'static Pdfium, source: &Path) -> Result<()> 
             None,
         )?;
         let mut app = App::new(engine, Language::Indonesian);
+        let recent_file = source.with_file_name("recent-pdfs-test.dat");
+        if recent_file.exists() {
+            std::fs::remove_file(&recent_file)?;
+        }
+        app.recent = RecentPdfs::load(Some(recent_file.clone()));
         app.zoom_picker = button;
         app.status = button;
         app.editor = button;
@@ -2738,12 +2838,45 @@ fn verify_window_controls(engine: &'static Pdfium, source: &Path) -> Result<()> 
             files.len(),
         );
         window_proc(parent, WM_DROPFILES, WPARAM(drop.0 as usize), LPARAM(0));
-        APP.with(|state| {
-            let state = state.borrow();
-            let app = state.as_ref().unwrap();
+        let source = std::path::absolute(source)?;
+        let other = source.with_file_name("Laporan & résumé.pdf");
+        APP.with(|state| -> Result<()> {
+            let mut state = state.borrow_mut();
+            let app = state.as_mut().unwrap();
             assert_eq!(app.doc.as_ref().unwrap().index, 0);
             assert_eq!(page_picker::selection(app.page_picker), Some(0));
-        });
+            assert_eq!(app.recent.paths(), [source.clone()]);
+            app.recent.remember(&other)?;
+            let menu = GetSubMenu(GetSubMenu(app.menu, 0), FILE_RECENT_POSITION);
+            populate_recent_menu(menu, app.recent.paths(), app.language)?;
+            assert_eq!(GetMenuItemCount(menu), 2);
+            let mut label = [0; 128];
+            let count = GetMenuStringW(
+                menu,
+                FIRST_RECENT_PDF as u32,
+                Some(&mut label),
+                MF_BYCOMMAND,
+            ) as usize;
+            assert!(String::from_utf16_lossy(&label[..count]).starts_with("Laporan && résumé.pdf"));
+            assert_eq!(
+                RecentPdfs::load(Some(recent_file.clone())).paths(),
+                [other.clone(), source.clone()]
+            );
+            process_message(
+                app,
+                parent,
+                WM_COMMAND,
+                command(FIRST_RECENT_PDF + 1),
+                LPARAM(0),
+            )?;
+            assert_eq!(app.doc.as_ref().unwrap().source, source);
+            assert_eq!(app.recent.paths(), [source.clone(), other.clone()]);
+            assert_eq!(
+                RecentPdfs::load(Some(recent_file.clone())).paths(),
+                [source.clone(), other.clone()]
+            );
+            Ok(())
+        })?;
 
         let mut indonesian_sign_width = 0;
         for (language, zoom, expected) in [
@@ -2851,7 +2984,7 @@ fn verify_window_controls(engine: &'static Pdfium, source: &Path) -> Result<()> 
             }
             assert_eq!(
                 GetMenuItemCount(GetSubMenu(app.menu, 0)),
-                FILE_COMMANDS.len() as i32
+                FILE_COMMANDS.len() as i32 + 1
             );
             assert_eq!(
                 GetMenuItemCount(GetSubMenu(app.menu, 1)),

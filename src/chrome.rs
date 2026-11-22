@@ -116,7 +116,7 @@ pub fn colorref(hex: u32) -> COLORREF {
     rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
 }
 
-fn preference_file(name: &str) -> Option<std::path::PathBuf> {
+pub(crate) fn preference_file(name: &str) -> Option<std::path::PathBuf> {
     std::env::var_os("LOCALAPPDATA")
         .map(|dir| std::path::PathBuf::from(dir).join("HubbyPDF").join(name))
 }

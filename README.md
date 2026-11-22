@@ -9,6 +9,7 @@ Jalankan `target/HubbyPDF/HubbyPDF.exe`. Jika dipindahkan ke komputer lain, sali
 - Klik **Tema** di kanan atas atau pilih **Tampilan → Tema gelap**. HubbyPDF mengingat pilihan tema dan menampilkan PDF dengan warna aslinya.
 - Pilih **Bahasa → Bahasa Indonesia** atau **Bahasa → English**. HubbyPDF mengingat pilihan bahasa.
 - Seret dan lepas PDF dari File Explorer ke jendela HubbyPDF, atau gunakan **File → Buka PDF** maupun **Ctrl+O**. Jika beberapa file dilepas sekaligus, HubbyPDF membuka PDF pertama dalam daftar. Anda juga bisa memberikan path PDF sebagai argumen.
+- Pilih **File → PDF terakhir dibuka** untuk membuka kembali salah satu dari 10 PDF terakhir. Daftar disimpan secara lokal dan tetap tersedia setelah aplikasi ditutup.
 - Pilih zoom **25%–500%** atau **Pas jendela** di kanan bawah. **100%** berarti ukuran aktual PDF pada skala Windows. Gunakan **Page Up / Page Down** untuk pindah halaman, **Ctrl+roda mouse** untuk zoom, dan **tombol panah** untuk menggeser halaman yang lebih besar dari area baca.
 - Klik nomor halaman di kiri bawah untuk membuka daftar dengan mini preview, lalu pilih halaman yang ingin dibuka.
 - Klik **Teks**, lalu klik posisi pada halaman. Ketik teks Latin dasar berukuran 14 pt dan tekan **Enter** untuk menempatkannya. **Esc** membatalkan teks yang masih diketik.
