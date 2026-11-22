@@ -357,8 +357,8 @@ impl Canvas {
                 &scene
                     .language
                     .text((
-                        "Baca, tandai, dan tanda tangani PDF.",
-                        "Read, annotate, and sign PDFs.",
+                        "Seret dan lepas PDF ke jendela ini.",
+                        "Drag and drop a PDF onto this window.",
                     ))
                     .encode_utf16()
                     .collect::<Vec<_>>(),

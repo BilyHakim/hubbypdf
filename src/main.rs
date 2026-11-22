@@ -30,6 +30,7 @@ use windows::{
             Controls::{DRAWITEMSTRUCT, Dialogs::*, EM_SETCUEBANNER, EM_SETLIMITTEXT},
             HiDpi::*,
             Input::KeyboardAndMouse::*,
+            Shell::{DragFinish, DragQueryFileW, HDROP},
             WindowsAndMessaging::*,
         },
     },
@@ -1757,6 +1758,36 @@ fn show_error(hwnd: HWND, language: Language, error: &(dyn std::error::Error + '
     }
 }
 
+fn dropped_pdf(drop: HDROP) -> Result<PathBuf> {
+    let path = unsafe {
+        let count = DragQueryFileW(drop, u32::MAX, None);
+        let path = (0..count).find_map(|index| {
+            let length = DragQueryFileW(drop, index, None);
+            if length == 0 {
+                return None;
+            }
+            let mut buffer = vec![0; length as usize + 1];
+            let copied = DragQueryFileW(drop, index, Some(&mut buffer));
+            if copied != length {
+                return None;
+            }
+            let path = PathBuf::from(OsString::from_wide(&buffer[..copied as usize]));
+            path.extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+                .then_some(path)
+        });
+        DragFinish(drop);
+        path
+    };
+    path.ok_or_else(|| {
+        Message((
+            "Seret file PDF ke jendela ini.",
+            "Drop a PDF file onto this window.",
+        ))
+        .into()
+    })
+}
+
 fn process_message(
     app: &mut App,
     hwnd: HWND,
@@ -2131,6 +2162,8 @@ extern "system" fn window_proc(
         }
         return LRESULT(0);
     }
+    // Release the drop handle even if a modal dialog has already borrowed App.
+    let dropped = (message == WM_DROPFILES).then(|| dropped_pdf(HDROP(wparam.0 as *mut _)));
     let handled = APP.with(|state| {
         let Ok(mut state) = state.try_borrow_mut() else {
             return false;
@@ -2138,7 +2171,20 @@ extern "system" fn window_proc(
         let Some(app) = state.as_mut() else {
             return false;
         };
-        match process_message(app, hwnd, message, wparam, lparam) {
+        let result = if let Some(path) = dropped {
+            path.and_then(|path| {
+                app.finish_form(hwnd, true)?;
+                app.notice = None;
+                if app.discard_allowed(hwnd) {
+                    app.open(hwnd, path)?;
+                }
+                app.sync(hwnd);
+                Ok(true)
+            })
+        } else {
+            process_message(app, hwnd, message, wparam, lparam)
+        };
+        match result {
             Ok(handled) => handled,
             Err(error) => {
                 app.notice = Some(error_text(app.language, error.as_ref()));
@@ -2151,7 +2197,7 @@ extern "system" fn window_proc(
             }
         }
     });
-    if handled {
+    if handled || message == WM_DROPFILES {
         LRESULT(0)
     } else {
         unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
@@ -2407,7 +2453,7 @@ fn run(language: Language) -> Result<()> {
             return Err(windows::core::Error::from_win32().into());
         }
         let hwnd = CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
+            WS_EX_ACCEPTFILES,
             class.lpszClassName,
             w!("HubbyPDF"),
             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
@@ -2568,6 +2614,12 @@ fn main() {
 
 #[cfg(test)]
 fn verify_window_controls(engine: &'static Pdfium, source: &Path) -> Result<()> {
+    use std::{mem::size_of, os::windows::ffi::OsStrExt, ptr};
+    use windows::Win32::{
+        System::Memory::{GMEM_FIXED, GlobalAlloc},
+        UI::Shell::DROPFILES,
+    };
+
     unsafe {
         let instance = GetModuleHandleW(None)?;
         let parent = CreateWindowExW(
@@ -2668,6 +2720,31 @@ fn verify_window_controls(engine: &'static Pdfium, source: &Path) -> Result<()> 
         )?);
         assert_eq!(app.doc.as_ref().unwrap().index, 1);
         APP.with(|state| *state.borrow_mut() = Some(app));
+        let files: Vec<u16> = "catatan.txt\0"
+            .encode_utf16()
+            .chain(source.as_os_str().encode_wide())
+            .chain([0, 0])
+            .collect();
+        let header_size = size_of::<DROPFILES>();
+        let drop = GlobalAlloc(GMEM_FIXED, header_size + size_of::<u16>() * files.len())?;
+        drop.0.cast::<DROPFILES>().write(DROPFILES {
+            pFiles: header_size as u32,
+            fWide: true.into(),
+            ..Default::default()
+        });
+        ptr::copy_nonoverlapping(
+            files.as_ptr(),
+            drop.0.cast::<u8>().add(header_size).cast(),
+            files.len(),
+        );
+        window_proc(parent, WM_DROPFILES, WPARAM(drop.0 as usize), LPARAM(0));
+        APP.with(|state| {
+            let state = state.borrow();
+            let app = state.as_ref().unwrap();
+            assert_eq!(app.doc.as_ref().unwrap().index, 0);
+            assert_eq!(page_picker::selection(app.page_picker), Some(0));
+        });
+
         let mut indonesian_sign_width = 0;
         for (language, zoom, expected) in [
             (Language::Indonesian, None, "Pas jendela  ▾"),
