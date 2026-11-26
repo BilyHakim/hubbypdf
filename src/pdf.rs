@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom},
     os::windows::fs::OpenOptionsExt,
@@ -72,10 +72,50 @@ struct LinkPage {
     config: PdfRenderConfig,
 }
 
+struct EditablePdf {
+    // Close page handles before their document.
+    pages: BTreeMap<u16, PdfPage<'static>>,
+    document: PdfDocument<'static>,
+}
+
+impl EditablePdf {
+    fn new(document: PdfDocument<'static>) -> Self {
+        Self {
+            pages: BTreeMap::new(),
+            document,
+        }
+    }
+
+    fn with_page<T>(
+        &self,
+        index: u16,
+        read: impl FnOnce(&PdfPage<'static>) -> Result<T>,
+    ) -> Result<T> {
+        if let Some(page) = self.pages.get(&index) {
+            read(page)
+        } else {
+            read(&self.document.pages().get(index)?)
+        }
+    }
+
+    fn add(&mut self, index: u16, mark: &Mark, offset: Point) -> Result<Option<MarkBounds>> {
+        let page = match self.pages.entry(index) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let mut page = self.document.pages().get(index)?;
+                // Serializing page contents can expand shared PDF resources into memory.
+                page.set_content_regeneration_strategy(PdfPageContentRegenerationStrategy::Manual);
+                entry.insert(page)
+            }
+        };
+        Document::apply(&mut self.document, page, mark, offset)
+    }
+}
+
 pub struct Document {
     // PDFium page handles must close before their document.
     link_page: Option<LinkPage>,
-    pdf: PdfDocument<'static>,
+    pdf: EditablePdf,
     pub source: PathBuf,
     pub index: u16,
     engine: &'static Pdfium,
@@ -99,7 +139,7 @@ impl Document {
         }
         Ok(Self {
             link_page: None,
-            pdf,
+            pdf: EditablePdf::new(pdf),
             engine,
             original,
             source,
@@ -111,7 +151,7 @@ impl Document {
     }
 
     pub fn count(&self) -> u16 {
-        self.pdf.pages().len()
+        self.pdf.document.pages().len()
     }
 
     fn revision(&self) -> u64 {
@@ -128,12 +168,12 @@ impl Document {
 
     #[cfg(test)]
     pub fn size(&self) -> Result<Point> {
-        let page = self.pdf.pages().get(self.index)?;
-        Self::page_size(&page)
+        self.pdf.with_page(self.index, Self::page_size)
     }
 
     pub fn sizes(&self) -> Result<Vec<Point>> {
         self.pdf
+            .document
             .pages()
             .page_sizes()?
             .into_iter()
@@ -170,19 +210,20 @@ impl Document {
     }
 
     pub fn render_page(&self, index: u16, width: i32, height: i32) -> Result<Raster> {
-        let page = self.pdf.pages().get(index)?;
-        Self::rasterize(&page, width, height)
+        self.pdf
+            .with_page(index, |page| Self::rasterize(page, width, height))
     }
 
     pub fn thumbnail(&self, index: u16, width: i32, height: i32) -> Result<Raster> {
-        let page = self.pdf.pages().get(index)?;
-        let (w, h) = Self::page_size(&page)?;
-        let scale = (width as f32 / w).min(height as f32 / h);
-        Self::rasterize(
-            &page,
-            (w * scale).round().max(1.0) as i32,
-            (h * scale).round().max(1.0) as i32,
-        )
+        self.pdf.with_page(index, |page| {
+            let (w, h) = Self::page_size(page)?;
+            let scale = (width as f32 / w).min(height as f32 / h);
+            Self::rasterize(
+                page,
+                (w * scale).round().max(1.0) as i32,
+                (h * scale).round().max(1.0) as i32,
+            )
+        })
     }
 
     fn rasterize(page: &PdfPage<'_>, width: i32, height: i32) -> Result<Raster> {
@@ -195,8 +236,12 @@ impl Document {
     }
 
     pub fn highlight_band(&self, at: Point) -> Result<(f32, f32)> {
-        let page = self.pdf.pages().get(self.index)?;
-        let size = Self::page_size(&page)?;
+        self.pdf
+            .with_page(self.index, |page| Self::page_highlight_band(page, at))
+    }
+
+    fn page_highlight_band(page: &PdfPage<'_>, at: Point) -> Result<(f32, f32)> {
+        let size = Self::page_size(page)?;
         let (w, h, config) = Self::edit_coordinates(size);
         let (x, y) = page.pixels_to_points(
             (at.0 * w as f32).round() as i32,
@@ -235,9 +280,10 @@ impl Document {
         if !self.has_form() {
             return Ok(None);
         }
-        let page = self.pdf.pages().get(index)?;
-        let (width, height, config) = Self::edit_coordinates(Self::page_size(&page)?);
-        forms::hit(&page, point, width, height, &config)
+        self.pdf.with_page(index, |page| {
+            let (width, height, config) = Self::edit_coordinates(Self::page_size(page)?);
+            forms::hit(page, point, width, height, &config)
+        })
     }
 
     fn with_link_destination<T>(
@@ -246,7 +292,7 @@ impl Document {
         point: Point,
         resolve: impl FnOnce(&PdfPages<'static>, u16, &PdfDestination<'_>) -> T,
     ) -> Option<T> {
-        let pages = self.pdf.pages();
+        let pages = self.pdf.document.pages();
         if self
             .link_page
             .as_ref()
@@ -332,6 +378,7 @@ impl Document {
 
     pub fn has_form(&self) -> bool {
         self.pdf
+            .document
             .form()
             .is_some_and(|form| matches!(form.form_type(), PdfFormType::Acrobat))
     }
@@ -354,7 +401,7 @@ impl Document {
             }
             mark => mark,
         };
-        let bounds = Self::apply(&mut self.pdf, self.index, &mark, (0.0, 0.0))?;
+        let bounds = self.pdf.add(self.index, &mark, (0.0, 0.0))?;
         self.next_revision += 1;
         self.edits
             .push((self.index, Edit::Add(mark, bounds), self.next_revision));
@@ -363,13 +410,12 @@ impl Document {
 
     fn apply(
         pdf: &mut PdfDocument<'static>,
-        index: u16,
+        page: &mut PdfPage<'static>,
         mark: &Mark,
         offset: Point,
     ) -> Result<Option<MarkBounds>> {
         let font = matches!(mark, Mark::Text(..)).then(|| pdf.fonts_mut().helvetica());
-        let mut page = pdf.pages().get(index)?;
-        let page_size = Self::page_size(&page)?;
+        let page_size = Self::page_size(page)?;
         let (w, h, config) = Self::edit_coordinates(page_size);
         let to_pdf = |(x, y): Point| {
             page.pixels_to_points(
@@ -665,7 +711,7 @@ impl Document {
         }
     }
 
-    fn rebuild(&self, count: usize) -> Result<PdfDocument<'static>> {
+    fn rebuild(&self, count: usize) -> Result<EditablePdf> {
         // PDFium 7543 can trap when removing a regenerated image object.
         let edits = &self.edits[..count];
         let mut form_changes = edits
@@ -676,7 +722,7 @@ impl Document {
             })
             .peekable();
         let mut original = self.original.try_clone()?;
-        let mut rebuilt = if form_changes.peek().is_some() {
+        let rebuilt = if form_changes.peek().is_some() {
             let mut bytes = Vec::new();
             original.seek(SeekFrom::Start(0))?;
             original.read_to_end(&mut bytes)?;
@@ -685,6 +731,7 @@ impl Document {
         } else {
             self.engine.load_pdf_from_reader(original, None)?
         };
+        let mut rebuilt = EditablePdf::new(rebuilt);
         let offsets = Self::offsets(edits);
         let erased = Self::erased(edits);
         for (id, (index, edit, _)) in edits.iter().enumerate() {
@@ -693,14 +740,13 @@ impl Document {
             {
                 let (a, b) = offsets.get(&id).copied().unwrap_or_default();
                 if let Mark::Highlight(start, end) = mark {
-                    Self::apply(
-                        &mut rebuilt,
+                    rebuilt.add(
                         *index,
                         &Mark::Highlight(translate(*start, a), translate(*end, b)),
                         (0.0, 0.0),
                     )?;
                 } else {
-                    Self::apply(&mut rebuilt, *index, mark, a)?;
+                    rebuilt.add(*index, mark, a)?;
                 }
             }
         }
@@ -732,12 +778,24 @@ impl Document {
         )))?;
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let temp = dir.join(format!(".hubbypdf-{}-{stamp}.tmp", std::process::id()));
+        let export = if self.pdf.pages.is_empty() {
+            None
+        } else {
+            // Drop the export document and the expanded resources once the save finishes.
+            let mut export = self.rebuild(self.edits.len())?;
+            for page in export.pages.values_mut() {
+                page.regenerate_content()?;
+            }
+            Some(export)
+        };
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temp)?;
-        let saved = self
-            .pdf
+        let saved = export
+            .as_ref()
+            .unwrap_or(&self.pdf)
+            .document
             .save_to_writer(&mut file)
             .map_err(Box::<dyn std::error::Error>::from)
             .and_then(|()| Ok(file.sync_all()?));
@@ -768,7 +826,7 @@ mod tests {
         let mut doc = Document::open(engine, source.to_owned())?;
         assert!(doc.has_form());
         let (text, choice, checkbox, read_only) = {
-            let page = doc.pdf.pages().get(0)?;
+            let page = doc.pdf.document.pages().get(0)?;
             let config = Document::edit_coordinates(Document::page_size(&page)?);
             let widgets = page.annotations();
             let mut text = None;
@@ -845,7 +903,7 @@ mod tests {
         ))?;
         doc.save_copy(output)?;
         let saved = Document::open(engine, output.to_owned())?;
-        let page = saved.pdf.pages().get(0)?;
+        let page = saved.pdf.document.pages().get(0)?;
         let widgets = page.annotations();
         let a = widgets.get(text.0)?;
         let b = widgets.get(choice.0)?;
@@ -1063,12 +1121,13 @@ mod tests {
         assert!(doc.save_copy(&source).is_err());
         doc.save_copy(&output)?;
         assert!(!doc.dirty());
+        assert_eq!(doc.pdf.document.pages().get(0)?.objects().len(), 0);
         assert_eq!(fs::read(source)?, original);
 
-        let mut saved = Document::open(engine, output)?;
+        let mut saved = Document::open(engine, output.clone())?;
         assert!(!saved.erase_at((0.52, 0.605), tolerance)?);
 
-        let page = saved.pdf.pages().get(0)?;
+        let page = saved.pdf.document.pages().get(0)?;
 
         assert_eq!(page.objects().len(), 4);
 
@@ -1076,17 +1135,20 @@ mod tests {
         let fill = page.objects().get(0)?.fill_color()?;
         assert_eq!((fill.red(), fill.green(), fill.blue()), (255, 0, 0));
         assert!(page.objects().get(0)?.bounds()?.left().value > 280.0);
+        drop(page);
+        drop(saved);
 
         doc.undo()?;
         assert!(doc.dirty());
 
-        assert_eq!(doc.pdf.pages().get(0)?.objects().len(), 5);
+        let object_count = |doc: &Document| doc.pdf.with_page(0, |page| Ok(page.objects().len()));
+        assert_eq!(object_count(&doc)?, 5);
         doc.undo()?;
-        assert_eq!(doc.pdf.pages().get(0)?.objects().len(), 5);
+        assert_eq!(object_count(&doc)?, 5);
         doc.undo()?;
-        assert_eq!(doc.pdf.pages().get(0)?.objects().len(), 5);
+        assert_eq!(object_count(&doc)?, 5);
         doc.undo()?;
-        assert_eq!(doc.pdf.pages().get(0)?.objects().len(), 4);
+        assert_eq!(object_count(&doc)?, 4);
         let first = doc.thumbnail(0, 52, 72)?;
         assert!(first.height > first.width);
         let second = doc.thumbnail(1, 52, 72)?;
@@ -1104,6 +1166,11 @@ mod tests {
         assert_eq!(doc.thumbnail(1, 52, 72)?.bytes, second.bytes);
         doc.undo()?;
         assert_eq!(doc.thumbnail(1, 52, 72)?.bytes, marked.bytes);
+        doc.save_copy(&output)?;
+        let saved = Document::open(engine, output)?;
+        assert_eq!(object_count(&saved)?, 4);
+        assert_eq!(saved.pdf.document.pages().get(1)?.objects().len(), 1);
+        assert!(saved.thumbnail(1, 52, 72)?.bytes != second.bytes);
         Ok(())
     }
 }

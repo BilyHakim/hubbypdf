@@ -4,7 +4,7 @@ Pembaca dan penyunting PDF lokal untuk Windows x64. HubbyPDF menggunakan Rust, k
 
 ## Instalasi di Windows
 
-Jalankan `HubbyPDF-0.1.1-x64.msi` pada Windows 10 atau 11 x64. Untuk memperbarui, tutup HubbyPDF lalu jalankan MSI yang sama. Installer memerlukan izin administrator dan memasang HubbyPDF ke Program Files, menambahkan shortcut ke Start Menu, serta mendaftarkannya sebagai pembuka PDF.
+Jalankan `HubbyPDF-0.1.4-x64.msi` pada Windows 10 atau 11 x64. Untuk memperbarui, tutup HubbyPDF lalu jalankan MSI versi terbaru. Installer memerlukan izin administrator dan memasang HubbyPDF ke Program Files, menambahkan shortcut ke Start Menu, serta mendaftarkannya sebagai pembuka PDF.
 
 Untuk menjadikan HubbyPDF pembuka PDF default, buka **Settings → Apps → Default apps**, cari `.pdf`, lalu pilih **HubbyPDF**. Aplikasi dapat dihapus dari daftar aplikasi terinstal di Windows.
 

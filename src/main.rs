@@ -7,6 +7,7 @@ mod forms;
 mod page_picker;
 mod pdf;
 mod recent;
+mod scrollbar;
 
 use std::{
     borrow::Cow,
@@ -246,6 +247,7 @@ struct App {
     zoom_picker: HWND,
     page_picker: HWND,
     scrollbar: HWND,
+    scrollbar_skin: HWND,
     scrollbar_width: i32,
     drag: Option<Drag>,
     selection: Option<(Vec<usize>, (Point, Point))>,
@@ -299,6 +301,7 @@ impl App {
             zoom_picker: HWND::default(),
             page_picker: HWND::default(),
             scrollbar: HWND::default(),
+            scrollbar_skin: HWND::default(),
             scrollbar_width: 0,
             drag: None,
             selection: None,
@@ -424,9 +427,12 @@ impl App {
                 }
             }
             self.header = px(MENU_ROW + chrome::HEADER + row * 42);
-            if !self.scrollbar.is_invalid() {
+            for bar in [self.scrollbar_skin, self.scrollbar]
+                .into_iter()
+                .filter(|bar| !bar.is_invalid())
+            {
                 MoveWindow(
-                    self.scrollbar,
+                    bar,
                     w - self.scrollbar_width,
                     self.header,
                     self.scrollbar_width,
@@ -719,9 +725,25 @@ impl App {
         let visible = self.max_scroll() > 0.0 && area.bottom > area.top;
         unsafe {
             if visible {
-                SetScrollInfo(self.scrollbar, SB_CTL, &self.scrollbar_info(), true);
+                SetScrollInfo(
+                    self.scrollbar,
+                    SB_CTL,
+                    &self.scrollbar_info(),
+                    self.contrast,
+                );
             }
+            let _ = ShowWindow(
+                self.scrollbar_skin,
+                if visible && !self.contrast {
+                    SW_SHOWNA
+                } else {
+                    SW_HIDE
+                },
+            );
             let _ = ShowWindow(self.scrollbar, if visible { SW_SHOWNA } else { SW_HIDE });
+            if visible && !self.contrast {
+                repaint(self.scrollbar_skin);
+            }
         }
     }
 
@@ -846,7 +868,10 @@ impl App {
         }
         let limit = self.max_scroll();
         let next = (self.scroll_y + y).clamp(0.0, limit);
-        if next != self.scroll_y {
+        if next == self.scroll_y && x == 0.0 {
+            return Ok(());
+        }
+        let page_changed = if next != self.scroll_y {
             self.finish_form(hwnd, true)?;
             self.scroll_y = next;
             let area = self.viewport();
@@ -862,10 +887,16 @@ impl App {
                     })
                     .unwrap_or(self.doc.as_ref().unwrap().index as usize)
             };
-            self.select_page(index as u16);
-        }
+            self.select_page(index as u16)
+        } else {
+            false
+        };
         self.pan_x += x;
-        self.update_view(hwnd)
+        self.update_view(hwnd)?;
+        if page_changed {
+            self.sync(hwnd);
+        }
+        Ok(())
     }
 
     fn apply_theme(&self, hwnd: HWND) {
@@ -933,6 +964,8 @@ impl App {
         }
         repaint(self.open_button);
         repaint(self.zoom_picker);
+        scrollbar::theme(self.scrollbar_skin, self.dark);
+        self.sync_scrollbar();
         repaint(hwnd);
     }
 
@@ -2109,6 +2142,7 @@ fn process_message(
         }
         WM_VSCROLL if !app.scrollbar.is_invalid() && lparam.0 == app.scrollbar.0 as isize => {
             app.scroll_from_bar(hwnd, SCROLLBAR_COMMAND(i32::from(wparam.0 as u16)))?;
+            return Ok(true);
         }
         WM_COMMAND if wparam.0 as u16 == ZOOM_PICKER => app.show_zoom_menu(hwnd)?,
         WM_COMMAND if wparam.0 as u16 == PAGE_PICKER => {
@@ -2348,8 +2382,10 @@ fn process_message(
                     delta
                 };
                 app.scroll_by(hwnd, direction * 64.0 * app.dpi, 0.0)?;
+                return Ok(true);
             } else {
                 app.scroll_by(hwnd, 0.0, f64::from(-delta * 64.0 * app.dpi))?;
+                return Ok(true);
             }
         }
         _ => return Ok(false),
@@ -2656,8 +2692,8 @@ fn keyboard(hwnd: HWND, message: &MSG) -> bool {
                 };
                 if let Err(error) = app.scroll_by(hwnd, x, f64::from(y)) {
                     show_error(hwnd, app.language, error.as_ref());
+                    app.sync(hwnd);
                 }
-                app.sync(hwnd);
                 return true;
             }
             _ => return false,
@@ -2768,7 +2804,7 @@ fn create_scrollbar(parent: HWND) -> Result<HWND> {
             WINDOW_EX_STYLE::default(),
             w!("SCROLLBAR"),
             w!(""),
-            WS_CHILD | WINDOW_STYLE(SBS_VERT as u32),
+            WS_CHILD | WS_CLIPSIBLINGS | WINDOW_STYLE(SBS_VERT as u32),
             0,
             0,
             0,
@@ -2896,6 +2932,7 @@ fn run(language: Language) -> Result<()> {
         )?;
         app.page_picker = page_picker::create(hwnd)?;
         app.scrollbar = create_scrollbar(hwnd)?;
+        app.scrollbar_skin = scrollbar::create(hwnd, app.scrollbar)?;
         for &(id, _, _) in chrome::TOOLS {
             let button = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
@@ -2967,6 +3004,35 @@ fn main() {
 }
 
 #[cfg(test)]
+fn assert_scroll_at_edge(
+    app: &mut App,
+    hwnd: HWND,
+    wheel: WPARAM,
+    command: SCROLLBAR_COMMAND,
+) -> Result<()> {
+    let scroll_y = app.scroll_y;
+    let button = app.toolbar[0].1;
+    unsafe {
+        let _ = ValidateRect(hwnd, None);
+        let _ = ValidateRect(button, None);
+    }
+    for _ in 0..3 {
+        process_message(app, hwnd, WM_MOUSEWHEEL, wheel, LPARAM(0))?;
+        process_message(
+            app,
+            hwnd,
+            WM_VSCROLL,
+            WPARAM(command.0 as usize),
+            LPARAM(app.scrollbar.0 as isize),
+        )?;
+    }
+    assert_eq!(app.scroll_y, scroll_y);
+    assert!(!unsafe { GetUpdateRect(hwnd, None, false) }.as_bool());
+    assert!(!unsafe { GetUpdateRect(button, None, false) }.as_bool());
+    Ok(())
+}
+
+#[cfg(test)]
 fn verify_window_controls(engine: &'static Pdfium, source: &Path, links: &Path) -> Result<()> {
     use std::{mem::size_of, os::windows::ffi::OsStrExt, ptr};
     use windows::Win32::{
@@ -3016,6 +3082,7 @@ fn verify_window_controls(engine: &'static Pdfium, source: &Path, links: &Path) 
         app.open_button = button;
         app.page_picker = page_picker::create(parent)?;
         app.scrollbar = create_scrollbar(parent)?;
+        app.scrollbar_skin = scrollbar::create(parent, app.scrollbar)?;
         for &(id, _, _) in chrome::TOOLS {
             let tool = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
@@ -3062,6 +3129,7 @@ fn verify_window_controls(engine: &'static Pdfium, source: &Path, links: &Path) 
         GetScrollInfo(app.scrollbar, SB_CTL, &mut bar_info)?;
         assert_eq!(bar_info.nPos, app.scrollbar_info().nPos);
         assert!(bar_info.nPos > 0);
+        scrollbar::verify_skin(app.scrollbar_skin, app.scrollbar)?;
         assert_eq!(app.visible_pages(), 0..2);
         let first = app.page_bounds(0);
         let second = app.page_bounds(1);
@@ -3091,6 +3159,7 @@ fn verify_window_controls(engine: &'static Pdfium, source: &Path, links: &Path) 
         assert_eq!(app.doc.as_ref().unwrap().index, 1);
         GetScrollInfo(app.scrollbar, SB_CTL, &mut bar_info)?;
         assert_eq!(bar_info.nPos, bar_info.nMax - bar_info.nPage as i32 + 1);
+        assert_scroll_at_edge(&mut app, parent, wheel(-120), SB_LINEDOWN)?;
         process_message(
             &mut app,
             parent,
@@ -3101,6 +3170,7 @@ fn verify_window_controls(engine: &'static Pdfium, source: &Path, links: &Path) 
         assert_eq!(app.scroll_y, 0.0);
         assert_eq!(app.doc.as_ref().unwrap().index, 0);
         assert_eq!(page_picker::selection(app.page_picker), Some(0));
+        assert_scroll_at_edge(&mut app, parent, wheel(120), SB_LINEUP)?;
         assert_eq!(
             SendMessageW(app.page_picker, CB_GETCOUNT, WPARAM(0), LPARAM(0)).0,
             2
