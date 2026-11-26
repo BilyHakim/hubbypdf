@@ -30,7 +30,9 @@ use windows::{
         Graphics::{Direct2D::Common::D2D_RECT_F, Dwm::*, Gdi::*},
         System::{LibraryLoader::GetModuleHandleW, SystemServices::SS_CENTERIMAGE},
         UI::{
-            Controls::{DRAWITEMSTRUCT, Dialogs::*, EM_SETCUEBANNER, EM_SETLIMITTEXT},
+            Controls::{
+                DRAWITEMSTRUCT, Dialogs::*, EM_SETCUEBANNER, EM_SETLIMITTEXT, SetScrollInfo,
+            },
             HiDpi::*,
             Input::KeyboardAndMouse::*,
             Shell::{DragFinish, DragQueryFileW, HDROP},
@@ -243,6 +245,8 @@ struct App {
     zoom: Option<u16>,
     zoom_picker: HWND,
     page_picker: HWND,
+    scrollbar: HWND,
+    scrollbar_width: i32,
     drag: Option<Drag>,
     selection: Option<(Vec<usize>, (Point, Point))>,
     selected_highlight: Option<(usize, (Point, Point))>,
@@ -260,6 +264,7 @@ struct App {
     colors: [usize; 4],
     shape: usize,
     gesture: Vec<Point>,
+    area_dragged: bool,
     signature: Option<DynamicImage>,
     notice: Option<String>,
 }
@@ -293,6 +298,8 @@ impl App {
             zoom: None,
             zoom_picker: HWND::default(),
             page_picker: HWND::default(),
+            scrollbar: HWND::default(),
+            scrollbar_width: 0,
             drag: None,
             selection: None,
             selected_highlight: None,
@@ -310,6 +317,7 @@ impl App {
             colors: [0, 0, 1, 0],
             shape: 0,
             gesture: Vec::new(),
+            area_dragged: false,
             signature: None,
             notice: None,
         }
@@ -324,6 +332,9 @@ impl App {
         let px = |n: i32| (n as f32 * dpi).round() as i32;
         self.footer = px(chrome::FOOTER);
         let (w, h) = (self.width as i32, self.height as i32);
+        self.scrollbar_width =
+            unsafe { GetSystemMetricsForDpi(SM_CXVSCROLL, (self.dpi * 96.0).round() as u32) }
+                .clamp(0, w);
         unsafe {
             let dc = CreateCompatibleDC(None);
             if dc.is_invalid() {
@@ -413,6 +424,16 @@ impl App {
                 }
             }
             self.header = px(MENU_ROW + chrome::HEADER + row * 42);
+            if !self.scrollbar.is_invalid() {
+                MoveWindow(
+                    self.scrollbar,
+                    w - self.scrollbar_width,
+                    self.header,
+                    self.scrollbar_width,
+                    (h - self.footer - self.header).max(0),
+                    true,
+                )?;
+            }
             let hero_top = (self.header + h - self.footer - px(chrome::HERO_H)) / 2;
             MoveWindow(
                 self.open_button,
@@ -440,7 +461,12 @@ impl App {
         D2D_RECT_F {
             left: 0.0,
             top,
-            right: self.width as f32,
+            right: self.width as f32
+                - if self.doc.is_some() {
+                    self.scrollbar_width as f32
+                } else {
+                    0.0
+                },
             bottom: (self.height.saturating_sub(self.footer as u32) as f32).max(top),
         }
     }
@@ -662,6 +688,67 @@ impl App {
         })
     }
 
+    fn scrollbar_info(&self) -> SCROLLINFO {
+        let area = self.viewport();
+        let height = f64::from(area.bottom - area.top);
+        let limit = self.max_scroll();
+        // Keep the native range representable while retaining pixel precision in ordinary PDFs.
+        let scale = (1_000_000.0 / (height + limit)).min(1.0);
+        let page = (height * scale).round().max(1.0) as u32;
+        let steps = (limit * scale).round().max(1.0) as i32;
+        SCROLLINFO {
+            cbSize: size_of::<SCROLLINFO>() as u32,
+            fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
+            nMin: 0,
+            nMax: steps + page as i32 - 1,
+            nPage: page,
+            nPos: if limit > 0.0 {
+                (self.scroll_y / limit * f64::from(steps)).round() as i32
+            } else {
+                0
+            },
+            nTrackPos: 0,
+        }
+    }
+
+    fn sync_scrollbar(&self) {
+        if self.scrollbar.is_invalid() {
+            return;
+        }
+        let area = self.viewport();
+        let visible = self.max_scroll() > 0.0 && area.bottom > area.top;
+        unsafe {
+            if visible {
+                SetScrollInfo(self.scrollbar, SB_CTL, &self.scrollbar_info(), true);
+            }
+            let _ = ShowWindow(self.scrollbar, if visible { SW_SHOWNA } else { SW_HIDE });
+        }
+    }
+
+    fn scroll_from_bar(&mut self, hwnd: HWND, command: SCROLLBAR_COMMAND) -> Result<()> {
+        let area = self.viewport();
+        let line = 50.0 * f64::from(self.dpi);
+        let page = (f64::from(area.bottom - area.top) - line).max(line);
+        let limit = self.max_scroll();
+        let delta = match command {
+            SB_LINEUP => -line,
+            SB_LINEDOWN => line,
+            SB_PAGEUP => -page,
+            SB_PAGEDOWN => page,
+            SB_TOP => -self.scroll_y,
+            SB_BOTTOM => limit - self.scroll_y,
+            SB_THUMBTRACK => {
+                let mut info = self.scrollbar_info();
+                let steps = f64::from(info.nMax - info.nPage as i32 + 1);
+                info.fMask = SIF_TRACKPOS;
+                unsafe { GetScrollInfo(self.scrollbar, SB_CTL, &mut info)? };
+                limit * f64::from(info.nTrackPos) / steps - self.scroll_y
+            }
+            _ => return Ok(()),
+        };
+        self.scroll_by(hwnd, 0.0, delta)
+    }
+
     fn stack_top(&self) -> f64 {
         let area = self.viewport();
         let height = f64::from(area.bottom - area.top);
@@ -714,6 +801,7 @@ impl App {
     }
 
     fn update_view(&mut self, hwnd: HWND) -> Result<()> {
+        self.sync_scrollbar();
         if self.width == 0 || self.height <= self.footer as u32 {
             return Ok(());
         }
@@ -1065,13 +1153,14 @@ impl App {
             return Ok(());
         }
         self.select_page(index);
-        self.jump_to_page(index);
+        self.jump_to_page(index, 0.0);
         self.update_view(hwnd)
     }
 
-    fn jump_to_page(&mut self, index: u16) {
+    fn jump_to_page(&mut self, index: u16, top: f32) {
         if let Some(page) = self.pages.get(index as usize) {
-            self.scroll_y = (page.top - f64::from(PAGE_MARGIN)).min(self.max_scroll());
+            let y = page.top + f64::from(top) * f64::from(page.size.1);
+            self.scroll_y = (y - f64::from(PAGE_MARGIN)).min(self.max_scroll());
             self.pan_x = 0.0;
         }
     }
@@ -1364,7 +1453,7 @@ impl App {
                 doc.undo()?;
                 if doc.index != previous {
                     let index = doc.index;
-                    self.jump_to_page(index);
+                    self.jump_to_page(index, 0.0);
                 }
                 self.refresh(hwnd)?;
             }
@@ -1435,6 +1524,29 @@ impl App {
             .map(|index| index as u16)
     }
 
+    fn over_pdf_link(&mut self, (x, y): Point) -> bool {
+        if self.tool != READ || self.drag.is_some() || !self.gesture.is_empty() {
+            return false;
+        }
+        let Some(index) = self.page_at((x, y)) else {
+            return false;
+        };
+        let rect = self.page_bounds(index as usize);
+        let point = (
+            (x - rect.left) / (rect.right - rect.left),
+            (y - rect.top) / (rect.bottom - rect.top),
+        );
+        if self.doc.as_ref().is_some_and(|doc| doc.index == index)
+            && (self.selection_contains(point) || self.highlight_handle(point).is_some())
+        {
+            return false;
+        }
+        let tolerance = self.hit_tolerance(rect);
+        self.doc
+            .as_mut()
+            .is_some_and(|doc| doc.has_link_at(index, point, tolerance))
+    }
+
     fn point(&self, lparam: LPARAM, clamp: bool) -> Option<Point> {
         let (x, y) = mouse_point(lparam);
         let r = self.page_rect;
@@ -1474,12 +1586,24 @@ impl App {
         })
     }
 
-    fn hit_tolerance(&self) -> Point {
-        let r = self.page_rect;
+    fn selection_contains(&self, point: Point) -> bool {
+        self.selection.as_ref().is_some_and(|(_, (a, b))| {
+            point.0 >= a.0 && point.0 <= b.0 && point.1 >= a.1 && point.1 <= b.1
+        })
+    }
+
+    fn hit_tolerance(&self, r: D2D_RECT_F) -> Point {
         (
             7.0 * self.dpi / (r.right - r.left),
             7.0 * self.dpi / (r.bottom - r.top),
         )
+    }
+
+    fn exceeds_click_distance(&self, start: Point, end: Point) -> bool {
+        let r = self.page_rect;
+        let dx = (end.0 - start.0) * (r.right - r.left);
+        let dy = (end.1 - start.1) * (r.bottom - r.top);
+        dx.abs().max(dy.abs()) > 4.0 * self.dpi
     }
 
     fn highlight_bounds(&self, start: Point, end: Point) -> (Point, Point) {
@@ -1751,6 +1875,14 @@ impl App {
         points.push(end);
         match self.tool {
             READ => {
+                if !self.area_dragged
+                    && !self.exceeds_click_distance(start, end)
+                    && let Some(link) = self.doc.as_mut().and_then(|doc| doc.link_at(start))
+                {
+                    self.select_page(link.page);
+                    self.jump_to_page(link.page, link.top);
+                    return self.update_view(hwnd);
+                }
                 self.selection = self
                     .doc
                     .as_ref()
@@ -1975,6 +2107,9 @@ fn process_message(
             app.resize(hwnd)?;
             return Ok(true);
         }
+        WM_VSCROLL if !app.scrollbar.is_invalid() && lparam.0 == app.scrollbar.0 as isize => {
+            app.scroll_from_bar(hwnd, SCROLLBAR_COMMAND(i32::from(wparam.0 as u16)))?;
+        }
         WM_COMMAND if wparam.0 as u16 == ZOOM_PICKER => app.show_zoom_menu(hwnd)?,
         WM_COMMAND if wparam.0 as u16 == PAGE_PICKER => {
             let event = (wparam.0 >> 16) as u32;
@@ -2041,7 +2176,7 @@ fn process_message(
             }
             if let Some(point) = app.point(lparam, false) {
                 if app.tool == ERASE {
-                    let tolerance = app.hit_tolerance();
+                    let tolerance = app.hit_tolerance(app.page_rect);
                     if let Some(doc) = app.doc.as_mut()
                         && doc.erase_at(point, tolerance)?
                     {
@@ -2062,11 +2197,8 @@ fn process_message(
                 } else if app.tool == TEXT {
                     app.begin_text(hwnd, point);
                 } else if app.tool == READ {
-                    if let Some((ids, bounds)) = &app.selection
-                        && point.0 >= bounds.0.0
-                        && point.0 <= bounds.1.0
-                        && point.1 >= bounds.0.1
-                        && point.1 <= bounds.1.1
+                    if app.selection_contains(point)
+                        && let Some((ids, bounds)) = &app.selection
                     {
                         app.drag = Some(Drag {
                             ids: ids.clone(),
@@ -2091,7 +2223,7 @@ fn process_message(
                         repaint(hwnd);
                         return Ok(true);
                     }
-                    let tolerance = app.hit_tolerance();
+                    let tolerance = app.hit_tolerance(app.page_rect);
                     if let Some((ids, bounds)) =
                         app.doc.as_ref().and_then(|doc| doc.hit(point, tolerance))
                     {
@@ -2110,6 +2242,7 @@ fn process_message(
                         }
                     } else {
                         app.gesture = vec![point];
+                        app.area_dragged = false;
                         unsafe {
                             SetCapture(hwnd);
                         }
@@ -2173,6 +2306,9 @@ fn process_message(
         }
         WM_MOUSEMOVE if !app.gesture.is_empty() => {
             if let Some(point) = app.point(lparam, true) {
+                if app.tool == READ && app.exceeds_click_distance(app.gesture[0], point) {
+                    app.area_dragged = true;
+                }
                 if matches!(app.tool, READ | HIGHLIGHT | PNG | SHAPE) {
                     app.gesture.truncate(1);
                 }
@@ -2184,6 +2320,9 @@ fn process_message(
             return Ok(true);
         }
         WM_LBUTTONUP if !app.gesture.is_empty() => {
+            if app.tool == READ && app.point(lparam, false).is_none() {
+                app.area_dragged = true;
+            }
             let result = app
                 .point(lparam, true)
                 .map_or(Ok(()), |end| app.finish_gesture(hwnd, end));
@@ -2227,6 +2366,26 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if message == WM_SETCURSOR && wparam.0 == hwnd.0 as usize && lparam.0 as u16 == HTCLIENT as u16
+    {
+        let mut cursor = POINT::default();
+        let over_link = unsafe {
+            GetCursorPos(&mut cursor).is_ok()
+                && ScreenToClient(hwnd, &mut cursor).as_bool()
+                && APP.with(|state| {
+                    state.try_borrow_mut().ok().is_some_and(|mut state| {
+                        state.as_mut().is_some_and(|app| {
+                            app.over_pdf_link((cursor.x as f32, cursor.y as f32))
+                        })
+                    })
+                })
+        };
+        if over_link && let Ok(hand) = unsafe { LoadCursorW(None, IDC_HAND) } {
+            unsafe { SetCursor(hand) };
+            return LRESULT(1);
+        }
+        return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
+    }
     if message == WM_SYNC_ZOOM_LABEL {
         let current = APP.with(|state| {
             state.try_borrow().ok().and_then(|state| {
@@ -2603,6 +2762,25 @@ fn make_menu(language: Language) -> Result<HMENU> {
     }
 }
 
+fn create_scrollbar(parent: HWND) -> Result<HWND> {
+    Ok(unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            w!("SCROLLBAR"),
+            w!(""),
+            WS_CHILD | WINDOW_STYLE(SBS_VERT as u32),
+            0,
+            0,
+            0,
+            0,
+            parent,
+            None,
+            GetModuleHandleW(None)?,
+            None,
+        )?
+    })
+}
+
 fn run(language: Language) -> Result<()> {
     let exe = std::env::current_exe()?;
     let engine = Box::leak(Box::new(load_pdfium(
@@ -2717,6 +2895,7 @@ fn run(language: Language) -> Result<()> {
             None,
         )?;
         app.page_picker = page_picker::create(hwnd)?;
+        app.scrollbar = create_scrollbar(hwnd)?;
         for &(id, _, _) in chrome::TOOLS {
             let button = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
@@ -2788,7 +2967,7 @@ fn main() {
 }
 
 #[cfg(test)]
-fn verify_window_controls(engine: &'static Pdfium, source: &Path) -> Result<()> {
+fn verify_window_controls(engine: &'static Pdfium, source: &Path, links: &Path) -> Result<()> {
     use std::{mem::size_of, os::windows::ffi::OsStrExt, ptr};
     use windows::Win32::{
         System::Memory::{GMEM_FIXED, GlobalAlloc},
@@ -2836,6 +3015,7 @@ fn verify_window_controls(engine: &'static Pdfium, source: &Path) -> Result<()> 
         app.editor = button;
         app.open_button = button;
         app.page_picker = page_picker::create(parent)?;
+        app.scrollbar = create_scrollbar(parent)?;
         for &(id, _, _) in chrome::TOOLS {
             let tool = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
@@ -2863,7 +3043,7 @@ fn verify_window_controls(engine: &'static Pdfium, source: &Path) -> Result<()> 
         assert!(GetDlgItem(parent, i32::from(NEXT)).is_err());
         let area = app.viewport();
         assert_eq!(area.left, 0.0);
-        assert_eq!(area.right, app.width as f32);
+        assert_eq!(area.right, (app.width as i32 - app.scrollbar_width) as f32);
         app.zoom_to(parent, Some(200))?;
         let command = |id| WPARAM(id as usize);
         process_message(&mut app, parent, WM_COMMAND, command(NEXT), LPARAM(0))?;
@@ -2878,6 +3058,10 @@ fn verify_window_controls(engine: &'static Pdfium, source: &Path) -> Result<()> 
         let wheel = |delta: i16| WPARAM((delta as u16 as usize) << 16);
         process_message(&mut app, parent, WM_MOUSEWHEEL, wheel(-120), LPARAM(0))?;
         assert!(app.scroll_y > 0.0);
+        let mut bar_info = app.scrollbar_info();
+        GetScrollInfo(app.scrollbar, SB_CTL, &mut bar_info)?;
+        assert_eq!(bar_info.nPos, app.scrollbar_info().nPos);
+        assert!(bar_info.nPos > 0);
         assert_eq!(app.visible_pages(), 0..2);
         let first = app.page_bounds(0);
         let second = app.page_bounds(1);
@@ -2895,12 +3079,28 @@ fn verify_window_controls(engine: &'static Pdfium, source: &Path) -> Result<()> 
         assert_eq!(app.doc.as_ref().unwrap().index, 1);
         assert_eq!(page_picker::selection(app.page_picker), Some(1));
         assert_eq!(app.page_rect, second);
-        app.scroll_by(parent, 0.0, app.max_scroll())?;
+        let scrollbar = LPARAM(app.scrollbar.0 as isize);
+        process_message(
+            &mut app,
+            parent,
+            WM_VSCROLL,
+            WPARAM(SB_BOTTOM.0 as usize),
+            scrollbar,
+        )?;
         assert_eq!(app.scroll_y, app.max_scroll());
         assert_eq!(app.doc.as_ref().unwrap().index, 1);
-        app.scroll_by(parent, 0.0, -app.max_scroll())?;
+        GetScrollInfo(app.scrollbar, SB_CTL, &mut bar_info)?;
+        assert_eq!(bar_info.nPos, bar_info.nMax - bar_info.nPage as i32 + 1);
+        process_message(
+            &mut app,
+            parent,
+            WM_VSCROLL,
+            WPARAM(SB_TOP.0 as usize),
+            scrollbar,
+        )?;
         assert_eq!(app.scroll_y, 0.0);
         assert_eq!(app.doc.as_ref().unwrap().index, 0);
+        assert_eq!(page_picker::selection(app.page_picker), Some(0));
         assert_eq!(
             SendMessageW(app.page_picker, CB_GETCOUNT, WPARAM(0), LPARAM(0)).0,
             2
@@ -3047,6 +3247,62 @@ fn verify_window_controls(engine: &'static Pdfium, source: &Path) -> Result<()> 
             let count = GetWindowTextW(button, &mut label) as usize;
             assert_eq!(String::from_utf16_lossy(&label[..count]), expected);
         }
+        APP.with(|state| -> Result<()> {
+            let mut state = state.borrow_mut();
+            let app = state.as_mut().unwrap();
+            let click_at = |app: &App, point: Point| {
+                let (pos, _) = app.form_rect((point, point));
+                LPARAM(pos.x as isize | ((pos.y as isize) << 16))
+            };
+            let press = |app: &mut App, click| {
+                process_message(app, parent, WM_LBUTTONDOWN, WPARAM(0), click)
+            };
+            let release =
+                |app: &mut App, click| process_message(app, parent, WM_LBUTTONUP, WPARAM(0), click);
+            app.open(parent, links.to_owned())?;
+            app.zoom_to(parent, Some(100))?;
+
+            let named = click_at(app, (156.0 / 595.0, 70.0 / 842.0));
+            let outside = click_at(app, (0.6, 0.2));
+            assert!(app.over_pdf_link(mouse_point(named)));
+            assert!(!app.over_pdf_link(mouse_point(outside)));
+            app.tool = HIGHLIGHT;
+            assert!(!app.over_pdf_link(mouse_point(named)));
+            app.tool = READ;
+            press(app, named)?;
+            assert!(!app.over_pdf_link(mouse_point(named)));
+            process_message(app, parent, WM_MOUSEMOVE, WPARAM(0), outside)?;
+            release(app, named)?;
+            assert_eq!(app.doc.as_ref().unwrap().index, 0);
+            assert_eq!(app.scroll_y, 0.0);
+
+            let local = click_at(app, (156.0 / 595.0, 110.0 / 842.0));
+            press(app, local)?;
+            release(app, local)?;
+            assert_eq!(app.doc.as_ref().unwrap().index, 0);
+            assert!((app.scroll_y - 372.0 * f64::from(app.actual_scale())).abs() < 2.0);
+
+            app.jump_to_page(0, 0.0);
+            app.update_view(parent)?;
+            press(app, named)?;
+            release(app, named)?;
+            assert_eq!(page_picker::selection(app.page_picker), Some(1));
+            let offset = app.scroll_y - app.pages[1].top + f64::from(PAGE_MARGIN);
+            assert!((offset - 342.0 * f64::from(app.actual_scale())).abs() < 2.0);
+            assert_eq!(app.zoom, Some(100));
+            assert!(!app.doc.as_ref().unwrap().dirty());
+
+            app.go_to_page(parent, 0)?;
+            assert!(app.over_pdf_link(mouse_point(named)));
+            app.doc
+                .as_mut()
+                .unwrap()
+                .add(Mark::Highlight((0.20, 0.07), (0.30, 0.10)))?;
+            assert!(!app.over_pdf_link(mouse_point(named)));
+            app.doc.as_mut().unwrap().undo()?;
+            assert!(app.over_pdf_link(mouse_point(named)));
+            Ok(())
+        })?;
         let dc = CreateCompatibleDC(None);
         assert!(!dc.is_invalid());
         APP.with(|state| {

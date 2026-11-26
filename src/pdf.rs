@@ -14,6 +14,11 @@ use windows::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
 
 pub type Point = (f32, f32);
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+pub struct LinkTarget {
+    pub page: u16,
+    pub top: f32,
+}
+
 pub const MAX_EDGE: f32 = 4096.0;
 pub const MAX_PIXELS: f32 = 9_500_000.0;
 type MarkBounds = (Point, Point);
@@ -59,7 +64,17 @@ enum Edit {
     Form(usize, forms::Value),
 }
 
+struct LinkPage {
+    index: u16,
+    page: PdfPage<'static>,
+    width: i32,
+    height: i32,
+    config: PdfRenderConfig,
+}
+
 pub struct Document {
+    // PDFium page handles must close before their document.
+    link_page: Option<LinkPage>,
     pdf: PdfDocument<'static>,
     pub source: PathBuf,
     pub index: u16,
@@ -83,6 +98,7 @@ impl Document {
             );
         }
         Ok(Self {
+            link_page: None,
             pdf,
             engine,
             original,
@@ -212,12 +228,106 @@ impl Document {
     }
 
     pub fn form_at(&self, point: Point) -> Result<Option<forms::Field>> {
+        self.form_at_page(self.index, point)
+    }
+
+    fn form_at_page(&self, index: u16, point: Point) -> Result<Option<forms::Field>> {
         if !self.has_form() {
             return Ok(None);
         }
-        let page = self.pdf.pages().get(self.index)?;
+        let page = self.pdf.pages().get(index)?;
         let (width, height, config) = Self::edit_coordinates(Self::page_size(&page)?);
         forms::hit(&page, point, width, height, &config)
+    }
+
+    fn with_link_destination<T>(
+        &mut self,
+        source: u16,
+        point: Point,
+        resolve: impl FnOnce(&PdfPages<'static>, u16, &PdfDestination<'_>) -> T,
+    ) -> Option<T> {
+        let pages = self.pdf.pages();
+        if self
+            .link_page
+            .as_ref()
+            .is_none_or(|page| page.index != source)
+        {
+            let page = pages.get(source).ok()?;
+            let (width, height, config) = Self::edit_coordinates(Self::page_size(&page).ok()?);
+            self.link_page = Some(LinkPage {
+                index: source,
+                page,
+                width,
+                height,
+                config,
+            });
+        }
+        let source = self.link_page.as_ref()?;
+        let (x, y) = source
+            .page
+            .pixels_to_points(
+                (point.0 * source.width as f32).round() as i32,
+                (point.1 * source.height as f32).round() as i32,
+                &source.config,
+            )
+            .ok()?;
+        let link = source.page.links().link_at_point(x, y)?;
+        let action = link.action();
+        let dest = link.destination().or_else(|| {
+            action
+                .as_ref()?
+                .as_local_destination_action()?
+                .destination()
+                .ok()
+        })?;
+        let index = dest
+            .page_index()
+            .ok()
+            .filter(|&index| index < pages.len())?;
+        Some(resolve(pages, index, &dest))
+    }
+
+    pub fn has_link_at(&mut self, source: u16, point: Point, tolerance: Point) -> bool {
+        self.with_link_destination(source, point, |_, _, _| ())
+            .is_some()
+            && self
+                .form_at_page(source, point)
+                .is_ok_and(|field| field.is_none())
+            && self.hit_mark(source, point, tolerance, false).is_none()
+    }
+
+    pub fn link_at(&mut self, point: Point) -> Option<LinkTarget> {
+        self.with_link_destination(self.index, point, |pages, index, dest| {
+            let (left, top) = match dest.view_settings() {
+                Ok(PdfDestinationViewSettings::SpecificCoordinatesAndZoom(x, y, _)) => (x, y),
+                Ok(PdfDestinationViewSettings::FitPageHorizontallyToWindow(y))
+                | Ok(PdfDestinationViewSettings::FitBoundsHorizontallyToWindow(y)) => (None, y),
+                Ok(PdfDestinationViewSettings::FitPageVerticallyToWindow(x))
+                | Ok(PdfDestinationViewSettings::FitBoundsVerticallyToWindow(x)) => (x, None),
+                Ok(PdfDestinationViewSettings::FitPageToRectangle(rect)) => {
+                    (Some(rect.left()), Some(rect.top()))
+                }
+                _ => (None, None),
+            };
+            let top = (left.is_some() || top.is_some())
+                .then_some(index)
+                .and_then(|index| {
+                    let target = pages.get(index).ok()?;
+                    let (_, height, config) =
+                        Self::edit_coordinates(Self::page_size(&target).ok()?);
+                    let (x, y) = target.pixels_to_points(0, 0, &config).ok()?;
+                    let (_, pixels) = target
+                        .points_to_pixels(
+                            left.filter(|point| point.value.is_finite()).unwrap_or(x),
+                            top.filter(|point| point.value.is_finite()).unwrap_or(y),
+                            &config,
+                        )
+                        .ok()?;
+                    Some((pixels as f32 / height as f32).clamp(0.0, 1.0))
+                })
+                .unwrap_or(0.0);
+            LinkTarget { page: index, top }
+        })
     }
 
     pub fn has_form(&self) -> bool {
@@ -395,7 +505,7 @@ impl Document {
     }
 
     pub fn hit(&self, point: Point, tolerance: Point) -> Option<(Vec<usize>, (Point, Point))> {
-        self.hit_mark(point, tolerance, false)
+        self.hit_mark(self.index, point, tolerance, false)
     }
 
     pub fn select_area(&self, start: Point, end: Point) -> Option<(Vec<usize>, MarkBounds)> {
@@ -448,6 +558,7 @@ impl Document {
 
     fn hit_mark(
         &self,
+        index: u16,
         point: Point,
         tolerance: Point,
         precise_ink: bool,
@@ -459,7 +570,7 @@ impl Document {
             .iter()
             .enumerate()
             .filter_map(|(id, (page, edit, _))| {
-                if *page != self.index || erased.contains(&id) {
+                if *page != index || erased.contains(&id) {
                     return None;
                 }
                 let Edit::Add(mark, bounds) = edit else {
@@ -516,7 +627,7 @@ impl Document {
     }
 
     pub fn erase_at(&mut self, point: Point, tolerance: Point) -> Result<bool> {
-        let Some((ids, _)) = self.hit_mark(point, tolerance, true) else {
+        let Some((ids, _)) = self.hit_mark(self.index, point, tolerance, true) else {
             return Ok(false);
         };
         self.update(Edit::Erase(ids))?;
@@ -542,6 +653,7 @@ impl Document {
         self.edits.push((self.index, edit, revision));
         match self.rebuild(self.edits.len()) {
             Ok(pdf) => {
+                self.link_page = None;
                 self.pdf = pdf;
                 self.next_revision = revision;
                 Ok(())
@@ -597,7 +709,9 @@ impl Document {
 
     pub fn undo(&mut self) -> Result<()> {
         if let Some((page, _, _)) = self.edits.last() {
-            self.pdf = self.rebuild(self.edits.len() - 1)?;
+            let pdf = self.rebuild(self.edits.len() - 1)?;
+            self.link_page = None;
+            self.pdf = pdf;
             self.index = *page;
             self.edits.pop();
         }
@@ -768,7 +882,7 @@ mod tests {
     }
 
     fn form_fixture() -> Vec<u8> {
-        let objects = [
+        pdf_fixture(&[
             "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [4 0 R 5 0 R 6 0 R 7 0 R] /DA (/Helv 12 Tf 0 g) /DR << /Font << /Helv 8 0 R >> >> >> >>",
             "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
             "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 500] /Resources << >> /Annots [4 0 R 5 0 R 6 0 R 7 0 R] >>",
@@ -779,7 +893,21 @@ mod tests {
             "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
             "<< /Type /XObject /Subtype /Form /BBox [0 0 26 26] /Length 0 >>\nstream\n\nendstream",
             "<< /Type /XObject /Subtype /Form /BBox [0 0 26 26] /Length 12 >>\nstream\n0 0 26 26 re\nendstream",
-        ];
+        ])
+    }
+
+    fn link_fixture() -> Vec<u8> {
+        pdf_fixture(&[
+            "<< /Type /Catalog /Pages 2 0 R /Dests << /chapter [4 0 R /XYZ 0 500 0] >> >>",
+            "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << >> /Annots [5 0 R 6 0 R] >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << >> >>",
+            "<< /Type /Annot /Subtype /Link /Rect [72 760 240 784] /Dest /chapter >>",
+            "<< /Type /Annot /Subtype /Link /Rect [72 720 240 744] /A << /S /GoTo /D [3 0 R /XYZ 0 470 0] >> >>",
+        ])
+    }
+
+    fn pdf_fixture(objects: &[&str]) -> Vec<u8> {
         let mut pdf = String::from("%PDF-1.7\n");
         let mut xref = String::from("0000000000 65535 f \n");
         use std::fmt::Write as _;
@@ -803,6 +931,8 @@ mod tests {
         fs::create_dir_all(&work)?;
         let form = work.join("acroform.pdf");
         fs::write(&form, form_fixture())?;
+        let links = work.join("toc.pdf");
+        fs::write(&links, link_fixture())?;
         form_roundtrip(engine, &form, &work.join("acroform-filled.pdf"))?;
         if let Some(sample) = std::env::var_os("HUBBYPDF_TEST_FORM") {
             form_roundtrip(
@@ -823,7 +953,7 @@ mod tests {
                 .create_page_at_end(PdfPagePaperSize::a4().landscape())?;
             blank.save_to_file(&source)?;
         }
-        crate::verify_window_controls(engine, &source)?;
+        crate::verify_window_controls(engine, &source, &links)?;
         let original = fs::read(&source)?;
         let mut doc = Document::open(engine, source.clone())?;
         let rendered = doc.render(420, 594)?;

@@ -4,7 +4,7 @@ Pembaca dan penyunting PDF lokal untuk Windows x64. HubbyPDF menggunakan Rust, k
 
 ## Instalasi di Windows
 
-Jalankan `HubbyPDF-0.1.0-x64.msi` pada Windows 10 atau 11 x64. Installer memerlukan izin administrator dan memasang HubbyPDF ke Program Files, menambahkan shortcut ke Start Menu, serta mendaftarkannya sebagai pembuka PDF. File MSI yang sama bisa disalin ke komputer Windows x64 lain.
+Jalankan `HubbyPDF-0.1.1-x64.msi` pada Windows 10 atau 11 x64. Untuk memperbarui, tutup HubbyPDF lalu jalankan MSI yang sama. Installer memerlukan izin administrator dan memasang HubbyPDF ke Program Files, menambahkan shortcut ke Start Menu, serta mendaftarkannya sebagai pembuka PDF.
 
 Untuk menjadikan HubbyPDF pembuka PDF default, buka **Settings → Apps → Default apps**, cari `.pdf`, lalu pilih **HubbyPDF**. Aplikasi dapat dihapus dari daftar aplikasi terinstal di Windows.
 
@@ -16,7 +16,8 @@ Buka **HubbyPDF** dari Start Menu setelah instalasi, atau jalankan versi portabe
 - Pilih **Bahasa → Bahasa Indonesia** atau **Bahasa → English**. HubbyPDF mengingat pilihan bahasa.
 - Seret dan lepas PDF dari File Explorer ke jendela HubbyPDF, atau gunakan **File → Buka PDF** maupun **Ctrl+O**. Jika beberapa file dilepas sekaligus, HubbyPDF membuka PDF pertama dalam daftar. Anda juga bisa memberikan path PDF sebagai argumen.
 - Pilih **File → PDF terakhir dibuka** untuk membuka kembali salah satu dari 10 PDF terakhir. Daftar disimpan secara lokal dan tetap tersedia setelah aplikasi ditutup.
-- Gulir dengan **roda mouse**, **touchpad**, atau **panah atas/bawah** untuk membaca halaman secara berurutan. Nomor halaman mengikuti posisi gulir. Gunakan **Page Up / Page Down** untuk langsung pindah halaman.
+- Gulir dengan **roda mouse**, **touchpad**, atau **panah atas/bawah** untuk membaca halaman secara berurutan. Seret bilah gulir di sisi kanan untuk berpindah cepat. Nomor halaman mengikuti posisi gulir. Gunakan **Page Up / Page Down** untuk langsung pindah halaman.
+- Dalam mode **Pilih**, kursor berubah menjadi ikon tangan di atas tautan internal. Klik tautan di daftar isi untuk langsung menuju bagian yang dirujuk.
 - Pilih zoom **25%–500%** atau **Pas jendela** di kanan bawah, atau gunakan **Ctrl+roda mouse**. **100%** berarti ukuran aktual PDF pada skala Windows. Gunakan **panah kiri/kanan** untuk menggeser tampilan saat halaman lebih lebar dari area baca.
 - Klik nomor halaman di kiri bawah untuk membuka daftar dengan mini preview, lalu pilih halaman yang ingin dibuka.
 - Klik **Teks**, lalu klik posisi pada halaman. Ketik teks Latin dasar berukuran 14 pt dan tekan **Enter** untuk menempatkannya. **Esc** membatalkan teks yang masih diketik.
