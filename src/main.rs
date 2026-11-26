@@ -12,6 +12,7 @@ use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
     ffi::OsString,
+    ops::Range,
     os::windows::ffi::OsStringExt,
     path::{Path, PathBuf},
 };
@@ -68,8 +69,8 @@ const PAGE_PICKER: u16 = 146;
 const FIRST_RECENT_PDF: u16 = 200;
 const FILE_RECENT_POSITION: i32 = 1;
 const MENU_ROW: i32 = 28;
-const PAGE_ARROW_SIZE: i32 = 36;
-const PAGE_ARROW_INSET: i32 = 10;
+const PAGE_MARGIN: f32 = 16.0;
+const PAGE_GAP: f32 = 12.0;
 const MENU_BUTTONS: &[(u16, Label)] = &[
     (MENU_FILE, ("File", "File")),
     (MENU_VIEW, ("Tampilan", "View")),
@@ -204,6 +205,17 @@ thread_local! {
     static PAINT_COLORS: Cell<PaintColors> = Cell::new(PaintColors::default());
 }
 
+struct PageLayout {
+    top: f64,
+    size: Point,
+}
+
+impl PageLayout {
+    fn bottom(&self) -> f64 {
+        self.top + f64::from(self.size.1)
+    }
+}
+
 struct App {
     engine: &'static Pdfium,
     doc: Option<Document>,
@@ -231,7 +243,6 @@ struct App {
     zoom: Option<u16>,
     zoom_picker: HWND,
     page_picker: HWND,
-    page_arrows: [(u16, HWND); 2],
     drag: Option<Drag>,
     selection: Option<(Vec<usize>, (Point, Point))>,
     selected_highlight: Option<(usize, (Point, Point))>,
@@ -239,7 +250,10 @@ struct App {
     text_at: Option<Point>,
     form_edit: Option<FormEdit>,
     signature_group: u64,
-    pan: Point,
+    pan_x: f32,
+    scroll_y: f64,
+    page_sizes: Vec<Point>,
+    pages: Vec<PageLayout>,
     size: Point,
     page_rect: D2D_RECT_F,
     tool: u16,
@@ -279,7 +293,6 @@ impl App {
             zoom: None,
             zoom_picker: HWND::default(),
             page_picker: HWND::default(),
-            page_arrows: [(PREVIOUS, HWND::default()), (NEXT, HWND::default())],
             drag: None,
             selection: None,
             selected_highlight: None,
@@ -287,7 +300,10 @@ impl App {
             text_at: None,
             form_edit: None,
             signature_group: 0,
-            pan: (0.0, 0.0),
+            pan_x: 0.0,
+            scroll_y: 0.0,
+            page_sizes: Vec::new(),
+            pages: Vec::new(),
             size: (0.0, 0.0),
             page_rect: D2D_RECT_F::default(),
             tool: READ,
@@ -397,15 +413,6 @@ impl App {
                 }
             }
             self.header = px(MENU_ROW + chrome::HEADER + row * 42);
-            let area = self.viewport();
-            let arrow = px(PAGE_ARROW_SIZE);
-            let inset = px(PAGE_ARROW_INSET);
-            let y = ((area.top + area.bottom - arrow as f32) / 2.0).round() as i32;
-            for ((_, button), x) in self.page_arrows.into_iter().zip([inset, w - inset - arrow]) {
-                if !button.is_invalid() {
-                    MoveWindow(button, x, y, arrow, arrow, true)?;
-                }
-            }
             let hero_top = (self.header + h - self.footer - px(chrome::HERO_H)) / 2;
             MoveWindow(
                 self.open_button,
@@ -422,48 +429,30 @@ impl App {
             {
                 self.canvas = None;
             }
-            if self.resizing && self.canvas.is_some() {
-                self.layout();
-                repaint(hwnd);
-            } else {
-                self.refresh(hwnd)?;
-            }
+            self.layout();
+            self.update_view(hwnd)?;
         }
         Ok(())
     }
 
     fn viewport(&self) -> D2D_RECT_F {
         let top = self.header as f32;
-        let width = self.width as f32;
-        let gutter = if self.doc.as_ref().is_some_and(|doc| doc.count() > 1) {
-            ((PAGE_ARROW_SIZE + 2 * PAGE_ARROW_INSET) as f32 * self.dpi)
-                .round()
-                .min(width / 2.0)
-        } else {
-            0.0
-        };
         D2D_RECT_F {
-            left: gutter,
+            left: 0.0,
             top,
-            right: width - gutter,
+            right: self.width as f32,
             bottom: (self.height.saturating_sub(self.footer as u32) as f32).max(top),
         }
     }
 
-    fn fit_scale(&self) -> f32 {
+    fn fit_scale(&self, (w, h): Point) -> f32 {
         let area = self.viewport();
-        ((area.right - area.left - 32.0).max(1.0) / self.size.0)
-            .min((area.bottom - area.top - 32.0).max(1.0) / self.size.1)
+        ((area.right - area.left - 2.0 * PAGE_MARGIN).max(1.0) / w)
+            .min((area.bottom - area.top - 2.0 * PAGE_MARGIN).max(1.0) / h)
     }
 
     fn actual_scale(&self) -> f32 {
         self.dpi * 96.0 / 72.0
-    }
-
-    fn can_pan(&self) -> bool {
-        let area = self.viewport();
-        self.page_rect.right - self.page_rect.left + 32.0 > area.right - area.left + 0.5
-            || self.page_rect.bottom - self.page_rect.top + 32.0 > area.bottom - area.top + 0.5
     }
 
     fn zoom_to(&mut self, hwnd: HWND, zoom: Option<u16>) -> Result<()> {
@@ -472,9 +461,10 @@ impl App {
         self.selection = None;
         self.gesture.clear();
         if zoom.is_none() {
-            self.pan = (0.0, 0.0);
+            self.pan_x = 0.0;
         }
-        self.refresh(hwnd)
+        self.layout();
+        self.update_view(hwnd)
     }
 
     fn show_menu(&mut self, hwnd: HWND, id: u16) -> Result<()> {
@@ -636,66 +626,158 @@ impl App {
     }
 
     fn layout(&mut self) {
-        let (w, h) = self.size;
-        if w <= 0.0 || h <= 0.0 {
-            self.page_rect = D2D_RECT_F::default();
+        let Some(doc) = &self.doc else {
             return;
-        }
+        };
+        let index = doc.index as usize;
+        let anchor = self.pages.get(index).map_or(0.0, |page| {
+            (self.scroll_y + f64::from(PAGE_MARGIN) - page.top) / f64::from(page.size.1)
+        });
+        let mut top = f64::from(PAGE_MARGIN);
+        self.pages = self
+            .page_sizes
+            .iter()
+            .map(|&(w, h)| {
+                let scale = self.zoom.map_or_else(
+                    || self.fit_scale((w, h)),
+                    |percent| f32::from(percent) * self.actual_scale() / 100.0,
+                );
+                let page = PageLayout {
+                    top,
+                    size: ((w * scale).round().max(1.0), (h * scale).round().max(1.0)),
+                };
+                top = page.bottom() + f64::from((PAGE_GAP * self.dpi).round());
+                page
+            })
+            .collect();
+        let page = &self.pages[index];
+        self.scroll_y = (page.top - f64::from(PAGE_MARGIN) + anchor * f64::from(page.size.1))
+            .clamp(0.0, self.max_scroll());
+    }
+
+    fn max_scroll(&self) -> f64 {
         let area = self.viewport();
-        let viewport = (area.right - area.left, area.bottom - area.top);
-        let scale = self.zoom.map_or_else(
-            || self.fit_scale(),
-            |percent| percent as f32 * self.actual_scale() / 100.0,
-        );
-        let (w, h) = ((w * scale).round().max(1.0), (h * scale).round().max(1.0));
-        let overflow = (
-            ((w - viewport.0 + 32.0) / 2.0).max(0.0),
-            ((h - viewport.1 + 32.0) / 2.0).max(0.0),
-        );
-        self.pan.0 = self.pan.0.clamp(-overflow.0, overflow.0);
-        self.pan.1 = self.pan.1.clamp(-overflow.1, overflow.1);
-        let left = (area.left + (viewport.0 - w) / 2.0 + self.pan.0).round();
-        let top = (area.top + (viewport.1 - h) / 2.0 + self.pan.1).round();
-        self.page_rect = D2D_RECT_F {
+        self.pages.last().map_or(0.0, |page| {
+            (page.bottom() + f64::from(PAGE_MARGIN) - f64::from(area.bottom - area.top)).max(0.0)
+        })
+    }
+
+    fn stack_top(&self) -> f64 {
+        let area = self.viewport();
+        let height = f64::from(area.bottom - area.top);
+        let content = self.pages.last().map_or(0.0, PageLayout::bottom) + f64::from(PAGE_MARGIN);
+        f64::from(area.top) + ((height - content) / 2.0).max(0.0) - self.scroll_y
+    }
+
+    fn visible_pages(&self) -> Range<usize> {
+        let area = self.viewport();
+        let top = self.stack_top();
+        let first = self
+            .pages
+            .partition_point(|page| page.bottom() <= f64::from(area.top) - top);
+        let end = self
+            .pages
+            .partition_point(|page| page.top < f64::from(area.bottom) - top);
+        first.min(end)..end
+    }
+
+    fn page_bounds(&self, index: usize) -> D2D_RECT_F {
+        let area = self.viewport();
+        let page = &self.pages[index];
+        let (w, h) = page.size;
+        let left = ((area.left + area.right - w) / 2.0 + self.pan_x).round();
+        let top = (self.stack_top() + page.top).round() as f32;
+        D2D_RECT_F {
             left,
             top,
             right: left + w,
             bottom: top + h,
-        };
+        }
+    }
+
+    fn update_active_page(&mut self) {
+        if let Some(doc) = &self.doc
+            && let Some(&size) = self.page_sizes.get(doc.index as usize)
+            && (doc.index as usize) < self.pages.len()
+        {
+            self.size = size;
+            self.page_rect = self.page_bounds(doc.index as usize);
+        }
         self.position_editor();
     }
 
     fn refresh(&mut self, hwnd: HWND) -> Result<()> {
+        if let Some(canvas) = &mut self.canvas {
+            canvas.retain_pages(0..0);
+        }
+        self.update_view(hwnd)
+    }
+
+    fn update_view(&mut self, hwnd: HWND) -> Result<()> {
         if self.width == 0 || self.height <= self.footer as u32 {
             return Ok(());
         }
-        self.size = self
-            .doc
-            .as_ref()
-            .map(Document::size)
-            .transpose()?
-            .unwrap_or_default();
-        self.layout();
+        let visible = self.visible_pages();
+        let area = self.viewport();
+        let max_width = self.pages[visible.clone()]
+            .iter()
+            .map(|page| page.size.0)
+            .fold(0.0, f32::max);
+        let overflow = ((max_width - (area.right - area.left)) / 2.0 + PAGE_MARGIN).max(0.0);
+        self.pan_x = self.pan_x.clamp(-overflow, overflow);
+        self.update_active_page();
         if self.canvas.is_none() {
             self.canvas = Some(Canvas::new(hwnd, self.width, self.height, self.dpi)?);
         }
-        let canvas = self.canvas.as_mut().unwrap();
-        let raster = if let Some(doc) = &self.doc {
-            let rect = self.page_rect;
-            let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
-            let scale = (pdf::MAX_EDGE / w.max(h))
-                .min((pdf::MAX_PIXELS / (w * h)).sqrt())
-                .min(1.0);
-            Some(doc.render(
-                (w * scale).round().max(1.0) as i32,
-                (h * scale).round().max(1.0) as i32,
-            )?)
-        } else {
-            None
-        };
-        canvas.set_page(raster)?;
+        self.canvas.as_mut().unwrap().retain_pages(visible.clone());
         repaint(hwnd);
+        if let Some(doc) = &self.doc {
+            for index in visible {
+                let rect = self.page_bounds(index);
+                let (w, h) = self.pages[index].size;
+                let scale = (pdf::MAX_EDGE / w.max(h))
+                    .min((pdf::MAX_PIXELS / (w * h)).sqrt())
+                    .min(1.0);
+                let width = (w * scale).round().max(1.0) as i32;
+                let height = (h * scale).round().max(1.0) as i32;
+                self.canvas.as_mut().unwrap().set_page(
+                    index,
+                    rect,
+                    (width, height),
+                    self.resizing,
+                    || doc.render_page(index as u16, width, height),
+                )?;
+            }
+        }
         Ok(())
+    }
+
+    fn scroll_by(&mut self, hwnd: HWND, x: f32, y: f64) -> Result<()> {
+        if self.pages.is_empty() || self.drag.is_some() || !self.gesture.is_empty() {
+            return Ok(());
+        }
+        let limit = self.max_scroll();
+        let next = (self.scroll_y + y).clamp(0.0, limit);
+        if next != self.scroll_y {
+            self.finish_form(hwnd, true)?;
+            self.scroll_y = next;
+            let area = self.viewport();
+            let index = if next == 0.0 {
+                0
+            } else if next == limit {
+                self.pages.len() - 1
+            } else {
+                self.visible_pages()
+                    .max_by_key(|&index| {
+                        let rect = self.page_bounds(index);
+                        (rect.bottom.min(area.bottom) - rect.top.max(area.top)) as i32
+                    })
+                    .unwrap_or(self.doc.as_ref().unwrap().index as usize)
+            };
+            self.select_page(index as u16);
+        }
+        self.pan_x += x;
+        self.update_view(hwnd)
     }
 
     fn apply_theme(&self, hwnd: HWND) {
@@ -758,7 +840,7 @@ impl App {
             let _ = InvalidateRect(self.status, None, true);
             let _ = InvalidateRect(self.editor, None, true);
         }
-        for &(_, button) in self.menu_buttons.iter().chain(&self.page_arrows) {
+        for &(_, button) in &self.menu_buttons {
             repaint(button);
         }
         repaint(self.open_button);
@@ -781,16 +863,6 @@ impl App {
             for ((_, button), (_, label, _)) in self.toolbar.iter().zip(chrome::TOOLS) {
                 let _ = SetWindowTextW(*button, PCWSTR(wide(language.text(*label)).as_ptr()));
                 repaint(*button);
-            }
-            for (id, button) in self.page_arrows {
-                if !button.is_invalid() {
-                    let label = if id == PREVIOUS {
-                        ("Halaman sebelumnya", "Previous page")
-                    } else {
-                        ("Halaman berikutnya", "Next page")
-                    };
-                    SetWindowTextW(button, PCWSTR(wide(language.text(label)).as_ptr()))?;
-                }
             }
             let _ = SetWindowTextW(
                 self.open_button,
@@ -884,25 +956,6 @@ impl App {
             );
             let _ = EnableWindow(self.zoom_picker, self.doc.is_some());
             page_picker::sync(self.page_picker, self.doc.as_ref());
-            let area = self.viewport();
-            for (id, button) in self.page_arrows {
-                if button.is_invalid() {
-                    continue;
-                }
-                let visible = area.bottom - area.top >= PAGE_ARROW_SIZE as f32 * self.dpi
-                    && self.doc.as_ref().is_some_and(|doc| doc.count() > 1);
-                let enabled = self.doc.as_ref().is_some_and(|doc| match id {
-                    PREVIOUS => doc.index > 0,
-                    _ => doc.index + 1 < doc.count(),
-                });
-                // Keep keyboard navigation on the canvas once the focused arrow reaches an end.
-                if !enabled && GetFocus() == button {
-                    let _ = SetFocus(hwnd);
-                }
-                let _ = EnableWindow(button, enabled);
-                let _ = ShowWindow(button, if visible { SW_SHOWNA } else { SW_HIDE });
-                repaint(button);
-            }
             // Owner-drawn buttons can request a synchronous repaint during WM_SETTEXT.
             let _ = PostMessageW(hwnd, WM_SYNC_ZOOM_LABEL, WPARAM(0), LPARAM(0));
             for &(id, button) in &self.toolbar {
@@ -967,9 +1020,14 @@ impl App {
 
     fn open(&mut self, hwnd: HWND, path: PathBuf) -> Result<()> {
         let doc = Document::open(self.engine, path)?;
-        doc.size()?;
+        let sizes = doc.sizes()?;
         page_picker::populate(self.page_picker, doc.count())?;
         self.doc = Some(doc);
+        self.page_sizes = sizes;
+        self.pages.clear();
+        if let Some(canvas) = &mut self.canvas {
+            canvas.retain_pages(0..0);
+        }
         unsafe {
             let _ = SetFocus(hwnd);
         }
@@ -981,7 +1039,8 @@ impl App {
         self.selection = None;
         self.selected_highlight = None;
         self.text_at = None;
-        self.pan = (0.0, 0.0);
+        self.pan_x = 0.0;
+        self.scroll_y = 0.0;
         self.resize(hwnd)?;
         if self
             .recent
@@ -999,11 +1058,28 @@ impl App {
 
     fn go_to_page(&mut self, hwnd: HWND, index: u16) -> Result<()> {
         self.finish_form(hwnd, true)?;
-        let Some(doc) = self.doc.as_mut() else {
+        let Some(doc) = &self.doc else {
             return Ok(());
         };
         if index == doc.index || index >= doc.count() {
             return Ok(());
+        }
+        self.select_page(index);
+        self.jump_to_page(index);
+        self.update_view(hwnd)
+    }
+
+    fn jump_to_page(&mut self, index: u16) {
+        if let Some(page) = self.pages.get(index as usize) {
+            self.scroll_y = (page.top - f64::from(PAGE_MARGIN)).min(self.max_scroll());
+            self.pan_x = 0.0;
+        }
+    }
+
+    fn select_page(&mut self, index: u16) -> bool {
+        let doc = self.doc.as_mut().unwrap();
+        if doc.index == index {
+            return false;
         }
         doc.index = index;
         self.notice = None;
@@ -1012,11 +1088,10 @@ impl App {
         self.selection = None;
         self.selected_highlight = None;
         self.text_at = None;
-        self.pan = (0.0, 0.0);
         unsafe {
             let _ = SetWindowTextW(self.editor, w!(""));
         }
-        self.refresh(hwnd)
+        true
     }
 
     fn color_slot(&self) -> Option<usize> {
@@ -1260,9 +1335,10 @@ impl App {
                 }
             }
             ZOOM_OUT | ZOOM_IN | FIT => {
-                let current = self
-                    .zoom
-                    .map_or_else(|| self.fit_scale() / self.actual_scale() * 100.0, f32::from);
+                let current = self.zoom.map_or_else(
+                    || self.fit_scale(self.size) / self.actual_scale() * 100.0,
+                    f32::from,
+                );
                 let level = match id {
                     ZOOM_IN => Some(
                         ZOOM_LEVELS
@@ -1284,7 +1360,12 @@ impl App {
                 self.zoom_to(hwnd, level)?;
             }
             UNDO => {
+                let previous = doc.index;
                 doc.undo()?;
+                if doc.index != previous {
+                    let index = doc.index;
+                    self.jump_to_page(index);
+                }
                 self.refresh(hwnd)?;
             }
             PNG => {
@@ -1336,13 +1417,26 @@ impl App {
             }
             _ => {}
         }
-        self.layout();
+        self.update_active_page();
         repaint(hwnd);
         Ok(())
     }
 
+    fn page_at(&self, (x, y): Point) -> Option<u16> {
+        let area = self.viewport();
+        if x < area.left || x >= area.right || y < area.top || y >= area.bottom {
+            return None;
+        }
+        self.visible_pages()
+            .find(|&index| {
+                let rect = self.page_bounds(index);
+                x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
+            })
+            .map(|index| index as u16)
+    }
+
     fn point(&self, lparam: LPARAM, clamp: bool) -> Option<Point> {
-        let (x, y) = ((lparam.0 as i16) as f32, ((lparam.0 >> 16) as i16) as f32);
+        let (x, y) = mouse_point(lparam);
         let r = self.page_rect;
         if self.doc.is_none() || r.right <= r.left || r.bottom <= r.top {
             return None;
@@ -1705,6 +1799,13 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain([0]).collect()
 }
 
+fn mouse_point(lparam: LPARAM) -> Point {
+    (
+        f32::from(lparam.0 as i16),
+        f32::from((lparam.0 >> 16) as i16),
+    )
+}
+
 fn repaint(hwnd: HWND) {
     unsafe {
         let _ = InvalidateRect(hwnd, None, false);
@@ -1907,6 +2008,7 @@ fn process_message(
                 if canvas
                     .draw(Scene {
                         page: app.page_rect,
+                        has_document: app.doc.is_some(),
                         viewport: app.viewport(),
                         dpi: app.dpi,
                         language: app.language,
@@ -1931,6 +2033,12 @@ fn process_message(
         }
         WM_LBUTTONDOWN => {
             app.finish_form(hwnd, true)?;
+            if let Some(index) = app.page_at(mouse_point(lparam))
+                && app.select_page(index)
+            {
+                app.update_active_page();
+                repaint(hwnd);
+            }
             if let Some(point) = app.point(lparam, false) {
                 if app.tool == ERASE {
                     let tolerance = app.hit_tolerance();
@@ -2095,19 +2203,14 @@ fn process_message(
             if key_down(VK_CONTROL) {
                 app.command(hwnd, if delta > 0.0 { ZOOM_IN } else { ZOOM_OUT })?;
             } else if message == WM_MOUSEHWHEEL || key_down(VK_SHIFT) {
-                app.pan.0 += if message == WM_MOUSEHWHEEL {
+                let direction = if message == WM_MOUSEHWHEEL {
                     -delta
                 } else {
                     delta
-                } * 64.0;
-                app.layout();
-                repaint(hwnd);
-            } else if app.can_pan() {
-                app.pan.1 += delta * 64.0;
-                app.layout();
-                repaint(hwnd);
+                };
+                app.scroll_by(hwnd, direction * 64.0 * app.dpi, 0.0)?;
             } else {
-                app.command(hwnd, if delta > 0.0 { PREVIOUS } else { NEXT })?;
+                app.scroll_by(hwnd, 0.0, f64::from(-delta * 64.0 * app.dpi))?;
             }
         }
         _ => return Ok(false),
@@ -2303,7 +2406,6 @@ fn keyboard(hwnd: HWND, message: &MSG) -> bool {
             .toolbar
             .iter()
             .chain(&app.menu_buttons)
-            .chain(&app.page_arrows)
             .find(|(_, button)| *button == message.hwnd)
             .map(|(id, _)| *id);
         if key == VK_TAB && !ctrl {
@@ -2316,8 +2418,6 @@ fn keyboard(hwnd: HWND, message: &MSG) -> bool {
                     app.editor,
                     app.open_button,
                     app.page_picker,
-                    app.page_arrows[0].1,
-                    app.page_arrows[1].1,
                     app.zoom_picker,
                 ])
                 .filter(|control| unsafe {
@@ -2387,15 +2487,18 @@ fn keyboard(hwnd: HWND, message: &MSG) -> bool {
                 app.sync(hwnd);
                 return true;
             }
-            (VK_UP | VK_DOWN | VK_LEFT | VK_RIGHT, false, false) if app.can_pan() => {
-                match key {
-                    VK_UP => app.pan.1 += 50.0,
-                    VK_DOWN => app.pan.1 -= 50.0,
-                    VK_LEFT => app.pan.0 += 50.0,
-                    _ => app.pan.0 -= 50.0,
+            (VK_UP | VK_DOWN | VK_LEFT | VK_RIGHT, false, false) if app.doc.is_some() => {
+                let step = 50.0 * app.dpi;
+                let (x, y) = match key {
+                    VK_UP => (0.0, -step),
+                    VK_DOWN => (0.0, step),
+                    VK_LEFT => (step, 0.0),
+                    _ => (-step, 0.0),
+                };
+                if let Err(error) = app.scroll_by(hwnd, x, f64::from(y)) {
+                    show_error(hwnd, app.language, error.as_ref());
                 }
-                app.layout();
-                repaint(hwnd);
+                app.sync(hwnd);
                 return true;
             }
             _ => return false,
@@ -2498,29 +2601,6 @@ fn make_menu(language: Language) -> Result<HMENU> {
         }
         Ok(menu)
     }
-}
-
-fn create_page_arrows(hwnd: HWND, arrows: &mut [(u16, HWND); 2]) -> Result<()> {
-    let instance = unsafe { GetModuleHandleW(None)? };
-    for (id, button) in arrows {
-        *button = unsafe {
-            CreateWindowExW(
-                WINDOW_EX_STYLE::default(),
-                w!("BUTTON"),
-                w!(""),
-                WS_CHILD | WS_TABSTOP | WINDOW_STYLE(BS_OWNERDRAW as u32),
-                0,
-                0,
-                0,
-                0,
-                hwnd,
-                HMENU(*id as usize as *mut _),
-                instance,
-                None,
-            )?
-        };
-    }
-    Ok(())
 }
 
 fn run(language: Language) -> Result<()> {
@@ -2637,7 +2717,6 @@ fn run(language: Language) -> Result<()> {
             None,
         )?;
         app.page_picker = page_picker::create(hwnd)?;
-        create_page_arrows(hwnd, &mut app.page_arrows)?;
         for &(id, _, _) in chrome::TOOLS {
             let button = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
@@ -2757,9 +2836,6 @@ fn verify_window_controls(engine: &'static Pdfium, source: &Path) -> Result<()> 
         app.editor = button;
         app.open_button = button;
         app.page_picker = page_picker::create(parent)?;
-        create_page_arrows(parent, &mut app.page_arrows)?;
-        app.doc = Some(Document::open(engine, source.to_owned())?);
-        page_picker::populate(app.page_picker, app.doc.as_ref().unwrap().count())?;
         for &(id, _, _) in chrome::TOOLS {
             let tool = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
@@ -2779,34 +2855,52 @@ fn verify_window_controls(engine: &'static Pdfium, source: &Path) -> Result<()> 
         }
         app.update_fonts(parent);
         app.set_language(Language::Indonesian)?;
-        app.resize(parent)?;
+        app.open(parent, source.to_owned())?;
         page_picker::sync(app.page_picker, app.doc.as_ref());
         app.sync(parent);
         assert_eq!(page_picker::selection(app.page_picker), Some(0));
-        assert!(!IsWindowEnabled(app.page_arrows[0].1).as_bool());
-        assert!(IsWindowEnabled(app.page_arrows[1].1).as_bool());
+        assert!(GetDlgItem(parent, i32::from(PREVIOUS)).is_err());
+        assert!(GetDlgItem(parent, i32::from(NEXT)).is_err());
         let area = app.viewport();
-        let mut origin = POINT::default();
-        assert!(ClientToScreen(parent, &mut origin).as_bool());
-        let mut left = RECT::default();
-        let mut right = RECT::default();
-        GetWindowRect(app.page_arrows[0].1, &mut left)?;
-        GetWindowRect(app.page_arrows[1].1, &mut right)?;
-        assert!(left.right - origin.x <= area.left as i32);
-        assert!(right.left - origin.x >= area.right as i32);
-        app.zoom = Some(200);
-        app.size = app.doc.as_ref().unwrap().size()?;
-        app.layout();
-        assert!(app.can_pan());
+        assert_eq!(area.left, 0.0);
+        assert_eq!(area.right, app.width as f32);
+        app.zoom_to(parent, Some(200))?;
         let command = |id| WPARAM(id as usize);
         process_message(&mut app, parent, WM_COMMAND, command(NEXT), LPARAM(0))?;
         assert_eq!(app.doc.as_ref().unwrap().index, 1);
         assert_eq!(app.zoom, Some(200));
-        assert!(!IsWindowEnabled(app.page_arrows[1].1).as_bool());
         process_message(&mut app, parent, WM_COMMAND, command(PREVIOUS), LPARAM(0))?;
         assert_eq!(app.doc.as_ref().unwrap().index, 0);
         assert_eq!(app.zoom, Some(200));
-        app.zoom = None;
+        MoveWindow(parent, 0, 0, 1100, 680, false)?;
+        app.resize(parent)?;
+        app.zoom_to(parent, None)?;
+        let wheel = |delta: i16| WPARAM((delta as u16 as usize) << 16);
+        process_message(&mut app, parent, WM_MOUSEWHEEL, wheel(-120), LPARAM(0))?;
+        assert!(app.scroll_y > 0.0);
+        assert_eq!(app.visible_pages(), 0..2);
+        let first = app.page_bounds(0);
+        let second = app.page_bounds(1);
+        assert_eq!(second.top - first.bottom, (PAGE_GAP * app.dpi).round());
+        assert!(second.right - second.left > first.right - first.left);
+        assert_eq!(page_picker::selection(app.page_picker), Some(0));
+        let x = (second.left + second.right) as i32 / 2;
+        assert_eq!(
+            app.page_at((x as f32, (first.bottom + second.top) / 2.0)),
+            None
+        );
+        let click = LPARAM(x as isize | ((second.top as isize + 4) << 16));
+        process_message(&mut app, parent, WM_LBUTTONDOWN, WPARAM(0), click)?;
+        process_message(&mut app, parent, WM_LBUTTONUP, WPARAM(0), click)?;
+        assert_eq!(app.doc.as_ref().unwrap().index, 1);
+        assert_eq!(page_picker::selection(app.page_picker), Some(1));
+        assert_eq!(app.page_rect, second);
+        app.scroll_by(parent, 0.0, app.max_scroll())?;
+        assert_eq!(app.scroll_y, app.max_scroll());
+        assert_eq!(app.doc.as_ref().unwrap().index, 1);
+        app.scroll_by(parent, 0.0, -app.max_scroll())?;
+        assert_eq!(app.scroll_y, 0.0);
+        assert_eq!(app.doc.as_ref().unwrap().index, 0);
         assert_eq!(
             SendMessageW(app.page_picker, CB_GETCOUNT, WPARAM(0), LPARAM(0)).0,
             2

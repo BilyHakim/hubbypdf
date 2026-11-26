@@ -110,13 +110,26 @@ impl Document {
         !self.edits.is_empty()
     }
 
+    #[cfg(test)]
     pub fn size(&self) -> Result<Point> {
         let page = self.pdf.pages().get(self.index)?;
         Self::page_size(&page)
     }
 
+    pub fn sizes(&self) -> Result<Vec<Point>> {
+        self.pdf
+            .pages()
+            .page_sizes()?
+            .into_iter()
+            .map(|rect| Self::checked_size((rect.width().value, rect.height().value)))
+            .collect()
+    }
+
     fn page_size(page: &PdfPage<'_>) -> Result<Point> {
-        let size = (page.width().value, page.height().value);
+        Self::checked_size((page.width().value, page.height().value))
+    }
+
+    fn checked_size(size: Point) -> Result<Point> {
         if !size.0.is_finite() || !size.1.is_finite() || size.0 <= 0.0 || size.1 <= 0.0 {
             return Err(Message((
                 "Ukuran halaman PDF tidak valid.",
@@ -135,8 +148,13 @@ impl Document {
             .use_lcd_text_rendering(true)
     }
 
+    #[cfg(test)]
     pub fn render(&self, width: i32, height: i32) -> Result<Raster> {
-        let page = self.pdf.pages().get(self.index)?;
+        self.render_page(self.index, width, height)
+    }
+
+    pub fn render_page(&self, index: u16, width: i32, height: i32) -> Result<Raster> {
+        let page = self.pdf.pages().get(index)?;
         Self::rasterize(&page, width, height)
     }
 

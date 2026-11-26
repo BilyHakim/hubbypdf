@@ -1,6 +1,6 @@
 ﻿# HubbyPDF
 
-Pembaca dan penyunting PDF lokal untuk Windows x64. HubbyPDF menggunakan Rust, kontrol Win32, Direct2D untuk menampilkan halaman, dan PDFium untuk membaca serta menyimpan PDF. Aplikasi merender satu halaman dan membatasi sisi terpanjang bitmap hingga 4.096 piksel dan total sekitar 9,5 juta piksel.
+Pembaca dan penyunting PDF lokal untuk Windows x64. HubbyPDF menggunakan Rust, kontrol Win32, Direct2D untuk menampilkan halaman, dan PDFium untuk membaca serta menyimpan PDF. Aplikasi merender halaman yang terlihat dan membatasi tiap bitmap hingga 4.096 piksel pada sisi terpanjang dan sekitar 9,5 juta piksel secara keseluruhan.
 
 ## Instalasi di Windows
 
@@ -16,7 +16,8 @@ Buka **HubbyPDF** dari Start Menu setelah instalasi, atau jalankan versi portabe
 - Pilih **Bahasa → Bahasa Indonesia** atau **Bahasa → English**. HubbyPDF mengingat pilihan bahasa.
 - Seret dan lepas PDF dari File Explorer ke jendela HubbyPDF, atau gunakan **File → Buka PDF** maupun **Ctrl+O**. Jika beberapa file dilepas sekaligus, HubbyPDF membuka PDF pertama dalam daftar. Anda juga bisa memberikan path PDF sebagai argumen.
 - Pilih **File → PDF terakhir dibuka** untuk membuka kembali salah satu dari 10 PDF terakhir. Daftar disimpan secara lokal dan tetap tersedia setelah aplikasi ditutup.
-- Pilih zoom **25%–500%** atau **Pas jendela** di kanan bawah. **100%** berarti ukuran aktual PDF pada skala Windows. Gunakan **Page Up / Page Down** untuk pindah halaman, **Ctrl+roda mouse** untuk zoom, dan **tombol panah** untuk menggeser halaman yang lebih besar dari area baca.
+- Gulir dengan **roda mouse**, **touchpad**, atau **panah atas/bawah** untuk membaca halaman secara berurutan. Nomor halaman mengikuti posisi gulir. Gunakan **Page Up / Page Down** untuk langsung pindah halaman.
+- Pilih zoom **25%–500%** atau **Pas jendela** di kanan bawah, atau gunakan **Ctrl+roda mouse**. **100%** berarti ukuran aktual PDF pada skala Windows. Gunakan **panah kiri/kanan** untuk menggeser tampilan saat halaman lebih lebar dari area baca.
 - Klik nomor halaman di kiri bawah untuk membuka daftar dengan mini preview, lalu pilih halaman yang ingin dibuka.
 - Klik **Teks**, lalu klik posisi pada halaman. Ketik teks Latin dasar berukuran 14 pt dan tekan **Enter** untuk menempatkannya. **Esc** membatalkan teks yang masih diketik.
 - Klik **Teks**, **Sketsa**, atau **Tanda tangan** untuk memilih warna dari sampel warna di menu alat. Menu **Bentuk** memuat pilihan bentuk dan warna sekaligus. Tiap alat mengingat warna terakhirnya selama aplikasi terbuka.

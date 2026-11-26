@@ -1,3 +1,5 @@
+use std::{collections::BTreeMap, ops::Range};
+
 use windows::{
     Win32::{
         Foundation::HWND,
@@ -12,12 +14,12 @@ use windows::{
 
 use crate::{
     chrome,
-    pdf::{Point, Raster},
+    pdf::{self, Point, Raster},
 };
 
 pub struct Canvas {
     target: ID2D1HwndRenderTarget,
-    bitmap: Option<ID2D1Bitmap>,
+    pages: BTreeMap<usize, (D2D_RECT_F, ID2D1Bitmap)>,
     mist: ID2D1LinearGradientBrush,
     night: ID2D1LinearGradientBrush,
     brush: ID2D1SolidColorBrush,
@@ -27,6 +29,7 @@ pub struct Canvas {
 
 pub struct Scene<'a> {
     pub page: D2D_RECT_F,
+    pub has_document: bool,
     pub viewport: D2D_RECT_F,
     pub dpi: f32,
     pub language: chrome::Language,
@@ -64,7 +67,7 @@ impl Canvas {
             let fonts: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
             Ok(Self {
                 target,
-                bitmap: None,
+                pages: BTreeMap::new(),
                 mist,
                 night,
                 brush,
@@ -78,28 +81,45 @@ impl Canvas {
         unsafe { self.target.Resize(&D2D_SIZE_U { width, height }) }
     }
 
-    pub fn set_page(&mut self, raster: Option<Raster>) -> Result<()> {
-        self.bitmap = None;
-        if let Some(raster) = raster {
-            self.bitmap = Some(unsafe {
-                self.target.CreateBitmap(
-                    D2D_SIZE_U {
-                        width: raster.width as u32,
-                        height: raster.height as u32,
-                    },
-                    Some(raster.bytes.as_ptr().cast()),
-                    raster.width as u32 * 4,
-                    &D2D1_BITMAP_PROPERTIES {
-                        pixelFormat: D2D1_PIXEL_FORMAT {
-                            format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                            alphaMode: D2D1_ALPHA_MODE_IGNORE,
-                        },
-                        dpiX: 96.0,
-                        dpiY: 96.0,
-                    },
-                )?
-            });
+    pub fn retain_pages(&mut self, visible: Range<usize>) {
+        self.pages.retain(|index, _| visible.contains(index));
+    }
+
+    pub fn set_page(
+        &mut self,
+        index: usize,
+        rect: D2D_RECT_F,
+        dimensions: (i32, i32),
+        resizing: bool,
+        render: impl FnOnce() -> pdf::Result<Raster>,
+    ) -> pdf::Result<()> {
+        if let Some((current, bitmap)) = self.pages.get_mut(&index) {
+            let size = unsafe { bitmap.GetPixelSize() };
+            if resizing || (size.width as i32, size.height as i32) == dimensions {
+                *current = rect;
+                return Ok(());
+            }
         }
+        let raster = render()?;
+        let bitmap = unsafe {
+            self.target.CreateBitmap(
+                D2D_SIZE_U {
+                    width: raster.width as u32,
+                    height: raster.height as u32,
+                },
+                Some(raster.bytes.as_ptr().cast()),
+                raster.width as u32 * 4,
+                &D2D1_BITMAP_PROPERTIES {
+                    pixelFormat: D2D1_PIXEL_FORMAT {
+                        format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                        alphaMode: D2D1_ALPHA_MODE_IGNORE,
+                    },
+                    dpiX: 96.0,
+                    dpiY: 96.0,
+                },
+            )?
+        };
+        self.pages.insert(index, (rect, bitmap));
         Ok(())
     }
 
@@ -125,7 +145,7 @@ impl Canvas {
             let brush = &self.brush;
             self.target
                 .PushAxisAlignedClip(&viewport, D2D1_ANTIALIAS_MODE_ALIASED);
-            if let Some(bitmap) = &self.bitmap {
+            for &(rect, ref bitmap) in self.pages.values() {
                 if scene.system_background.is_none() {
                     brush.SetColor(&if scene.dark {
                         color(0.0, 0.0, 0.0, 0.55)
@@ -149,7 +169,8 @@ impl Canvas {
                     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
                     None,
                 );
-            } else if scene.system_background.is_none() {
+            }
+            if !scene.has_document && scene.system_background.is_none() {
                 self.draw_empty(&scene);
             }
             let to_screen = |(x, y): Point| D2D_POINT_2F {
